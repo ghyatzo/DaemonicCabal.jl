@@ -1202,12 +1202,9 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print(" - Sandbox remote clients: disabled\n", .{});
     if (cfg.sandbox_session_bypass)
         std.debug.print(" - Sandbox session bypass: enabled\n", .{});
-    if (cfg.transport == .unix) {
-        Io.Dir.createDirAbsolute(io, cfg.runtime_dir, .default_dir) catch |err| switch (err) {
-            error.PathAlreadyExists => {},
-            else => return err,
-        };
-        conductor.cleanupRuntimeDir();
-    }
+    // The runtime dir is needed even in TCP mode: the conductor↔worker setup
+    // socket (wsetup.sock) is always a unix socket created there (see worker.zig).
+    try Io.Dir.cwd().createDirPath(io, cfg.runtime_dir);
+    conductor.cleanupRuntimeDir();
     try conductor.run();
 }

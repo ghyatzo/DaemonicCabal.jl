@@ -100,7 +100,10 @@ function create_socket(port::Integer=0)::Pair{Union{Sockets.PipeServer, Sockets.
         # Reporting the bind address (e.g. 0.0.0.0) would fail for remote clients.
         server => ":$(actual_port)"
     else
-        sockfile = string("worker-", WORKER_ID[], '-', String(rand('a':'z', 8)), ".sock")
+        # Use a more compact filename on MacOS since it has a shorter max path length
+        # and a deeper default runtime directory.
+        sockfile = string(@static(if Sys.isapple() "w-" else "worker-" end),
+                          WORKER_ID[], '-', String(rand('a':'z', 8)), ".sock")
         path = joinpath(RUNTIME_DIR, sockfile)
         Sockets.listen(path) => path
     end

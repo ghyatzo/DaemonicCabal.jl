@@ -66,9 +66,11 @@ pub fn isLoopback(addr: *const posix.sockaddr, addr_len: posix.socklen_t) bool {
 
 // Paths — BSD/macOS-specific default runtime directory
 pub fn defaultRuntimeDir(out: anytype, xdg_runtime_dir: ?[]const u8, home: ?[]const u8) ![]const u8 {
-    if (xdg_runtime_dir) |xdg|
-        return shared.print(out, "{s}/julia-daemon", .{xdg});
     if (builtin.os.tag == .macos) {
+        // macOS has no standard XDG_RUNTIME_DIR. Honoring it points sockets at a
+        // per-process, often sandbox-private /var/folders path that the client
+        // (a separate process) can't reach, so ignore it and use the native,
+        // shared location. Users can still override with JULIA_DAEMON_RUNTIME.
         const home_dir = home orelse blk: {
             var pwd: c.passwd = undefined;
             var pw_result: ?*c.passwd = null;
@@ -79,5 +81,7 @@ pub fn defaultRuntimeDir(out: anytype, xdg_runtime_dir: ?[]const u8, home: ?[]co
         };
         return shared.print(out, "{s}/Library/Application Support/julia-daemon", .{home_dir});
     }
+    if (xdg_runtime_dir) |xdg|
+        return shared.print(out, "{s}/julia-daemon", .{xdg});
     return shared.print(out, "/tmp/julia-daemon-{d}", .{c.getuid()});
 }
