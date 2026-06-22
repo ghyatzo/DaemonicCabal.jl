@@ -21,12 +21,21 @@ pub const Timeval = c.timeval;
 pub const getpid = c.getpid;
 pub const getppid = c.getppid;
 
-// I/O — write wraps the libc call to take a slice and log errors.
+// I/O — write wraps the libc call; loops until the whole buffer is written, as a
+// single write() can be short and silently dropping the remainder truncates output.
 pub fn write(fd: posix.fd_t, buf: []const u8) void {
-    const ret = c.write(fd, buf.ptr, buf.len);
-    if (ret < 0) {
-        @branchHint(.cold);
-        std.debug.print("write error on fd {}: {}\n", .{ fd, @as(posix.E, @enumFromInt(c._errno().*)) });
+    var written: usize = 0;
+    while (written < buf.len) {
+        const ret = c.write(fd, buf.ptr + written, buf.len - written);
+        if (ret < 0) {
+            @branchHint(.cold);
+            const e = @as(posix.E, @enumFromInt(c._errno().*));
+            if (e == .INTR) continue;
+            std.debug.print("write error on fd {}: {}\n", .{ fd, e });
+            return;
+        }
+        if (ret == 0) return; // no progress; avoid spinning
+        written += @intCast(ret);
     }
 }
 
