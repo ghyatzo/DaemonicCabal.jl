@@ -158,12 +158,22 @@ pub const BufReader = struct {
     }
 };
 
+/// Length of `sun_path` for this platform (104 on macOS, 108 on Linux/Windows).
+/// A bound socket path must fit here including a NUL terminator, so the usable
+/// path length is one less than this.
+const sun_path_len = @typeInfo(@FieldType(std.posix.sockaddr.un, "path")).array.len;
+
 /// Generate a random socket path in the given runtime directory
 pub fn randomSocketPath(io: Io, runtime_dir: []const u8, suffix: []const u8, buf: []u8) ![]const u8 {
     var rand_buf: [8]u8 = undefined;
     io.random(&rand_buf);
     const hex = std.fmt.bytesToHex(rand_buf, .lower);
-    return std.fmt.bufPrint(buf, "{s}/{s}-{s}", .{ runtime_dir, &hex, suffix }) catch error.PathTooLong;
+    const path = std.fmt.bufPrint(buf, "{s}/{s}-{s}", .{ runtime_dir, &hex, suffix }) catch
+        return error.PathTooLong;
+    // Surface an over-long runtime dir as a clear error rather than letting the
+    // bind overflow sun_path and panic deep inside std.
+    if (path.len >= sun_path_len) return error.PathTooLong;
+    return path;
 }
 
 // --- Port pool for managed TCP port ranges ---
