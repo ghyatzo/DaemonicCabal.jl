@@ -286,6 +286,17 @@ pub const Worker = struct {
         self.writeHeader(.soft_exit, 0);
     }
 
+    /// Ask the worker to interrupt a specific client's task via InterruptException.
+    /// Fire-and-forget: no ack is read, so this returns immediately and does not
+    /// block subsequent interrupt attempts. The worker will process the message
+    /// asynchronously on its main (interactive) thread.
+    pub fn sendInterrupt(self: *Worker, pid: u32) void {
+        self.writeHeader(.interrupt_client, 4);
+        var pid_buf: [4]u8 = undefined;
+        std.mem.writeInt(u32, &pid_buf, pid, .little);
+        platform.write(self.socket, &pid_buf);
+    }
+
     /// Send list of active PIDs to worker; worker kills any clients not in list.
     /// Returns the worker's reported remaining client count.
     pub fn syncClients(self: *Worker, pids: []const u32) !u16 {

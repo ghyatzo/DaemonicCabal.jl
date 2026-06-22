@@ -54,6 +54,21 @@ function perform_ttl_check(::Timer)
     end
 end
 
+# Interrupt a specific client's running task by PID.
+# Uses `schedule(task, InterruptException(); error=true)` which delivers
+# at the next yield/safepoint. This works for I/O-blocking code (sleep, read,
+# etc.) but cannot interrupt tight CPU-bound loops like `while true end` —
+# those require Julia's C-level force-throw mechanism which needs OS-level
+# SIGINT delivery to the process (not available through this path).
+# Returns: 0 = interrupted, 1 = not found, 2 = already done
+function interrupt_client_task(pid::Int)::UInt16
+    task = @lock STATE.lock get(STATE.client_tasks, pid, nothing)
+    isnothing(task) && return UInt16(1)
+    istaskdone(task) && return UInt16(2)
+    Base.schedule(task, InterruptException(); error=true)
+    UInt16(0)
+end
+
 # Kill client tasks whose PIDs are not in the active set (conductor thinks they're gone)
 function kill_stuck_clients(active_pids::Set{Int})
     orphan_tasks = @lock STATE.lock [
@@ -61,11 +76,19 @@ function kill_stuck_clients(active_pids::Set{Int})
         if pid ∉ active_pids && !istaskdone(task)
     ]
     for task in orphan_tasks
-        Base.schedule(task, InterruptException(); error=true)
+        Base.schedule(task, DaemonClientExit(1); error=true)
     end
     for task in orphan_tasks
         try wait(task) catch end
     end
+end
+
+# Active client's signals socket for the pre-1.11 path, which lacks the
+# ScopedValues-based ACTIVE_TERM that carries it on newer versions. Set around the
+# session in run.jl; read by the raw! override. The pre-1.11 redirect_stdio path is
+# single-client (it redirects process-global stdio), so a plain Ref is sufficient.
+@static if VERSION < v"1.11"
+    const CLIENT_SIGNALS = Ref{Any}(nothing)
 end
 
 # Signal protocol (Worker → Client via signals socket)
@@ -281,7 +304,7 @@ function spawn_sync_client!(client::ClientInfo, client_stdin::StreamIO,
             @lock STATE.lock STATE.client_tasks[client.pid] = task
             if new_session
                 # Session-owned: exits when mergedin reaches EOF (last client disconnected)
-                Threads.@spawn try
+                Threads.@spawn :interactive try
                     runclient(client, session.mergedin, session.out, session.err, signals;
                               owned_streams=(), sync_session=session,
                               repl_ref=session.repl)
@@ -295,7 +318,7 @@ function spawn_sync_client!(client::ClientInfo, client_stdin::StreamIO,
             out = BroadcastWriter(StreamIO[client_stdout; existing.out.writers])
             err = BroadcastWriter(StreamIO[client_stderr; existing.err.writers])
             has_repl = isassigned(existing.repl) && existing.repl[].mistate !== nothing
-            task = Threads.@spawn begin
+            task = Threads.@spawn :interactive begin
                 # Clear the in-progress REPL input before eval output
                 if has_repl
                     let mi = existing.repl[].mistate::REPL.LineEdit.MIState
@@ -330,7 +353,7 @@ function spawn_sync_client!(client::ClientInfo, client_stdin::StreamIO,
         end
     else
         # Non-interactive, no session: direct passthrough
-        task = Threads.@spawn begin
+        task = Threads.@spawn :interactive begin
             try
                 runclient(client, client_stdin, client_stdout, client_stderr, signals;
                           owned_streams=(client_stdout, client_stderr))
@@ -384,7 +407,7 @@ function spawn_client!(conn::IO, client::ClientInfo)
     close(stdin_srv); close(stdout_srv); close(stderr_srv); close(signals_srv)
     label = sync_session_label(client)
     if isnothing(label)
-        task = Threads.@spawn try
+        task = Threads.@spawn :interactive try
             runclient(client, client_stdin, client_stdout, client_stderr, signals)
         catch
             isopen(client_stdout) && rethrow()
@@ -475,6 +498,10 @@ function runworker(socketpath::String, worker_number::Int=-1, conductor_address:
                 write_header(conn, MSG_TYPE.ack, 2)
                 write(conn, UInt16(remaining))
                 flush(conn)
+            elseif header.msg_type == MSG_TYPE.interrupt_client
+                # Fire-and-forget: no ack sent. The conductor also sends SIGINT
+                # to the process for tasks stuck in tight loops.
+                interrupt_client_task(Int(read(conn, UInt32)))
             else
                 # Skip unknown message payload
                 read(conn, header.payload_len)

@@ -48,7 +48,10 @@ pub fn run(
     var stdout_eof = false;
     var stderr_eof = false;
     while (true) {
-        _ = try ring.submit_and_wait(1);
+        _ = ring.submit_and_wait(1) catch |err| switch (err) {
+            error.SignalInterrupt => continue, // SIGINT handled by signal handler, restart
+            else => return err,
+        };
         while (ring.cq_ready() > 0) {
             const cqe = try ring.copy_cqe();
             const len: usize = @intCast(@max(0, cqe.res));
