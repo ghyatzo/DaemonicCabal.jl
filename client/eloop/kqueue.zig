@@ -42,14 +42,17 @@ pub fn run(
         makeKevent(@intCast(signals_fd), c.EVFILT.READ, c.EV.ADD, 0, 0, UDATA_SIGNALS),
     };
     var no_events: [0]c.Kevent = undefined;
-    if (keventCall(kq, &changes, &no_events) < 0) {
+    if (keventCall(kq, &changes, &no_events, null) < 0) {
         return error.KqueueRegisterFailed;
     }
-    // Register stdin separately: may fail on macOS when stdin is a device
-    // file like /dev/null (kqueue returns EINVAL for non-pollable fds).
-    // If registration fails, stdin events simply won't be delivered.
-    var stdin_change = [1]c.Kevent{makeKevent(@intCast(posix.STDIN_FILENO), c.EVFILT.READ, c.EV.ADD, 0, 0, UDATA_STDIN)};
-    _ = keventCall(kq, &stdin_change, &no_events);
+    // stdin can't always be polled: regular files never report EV_EOF and
+    // /dev/null fails registration. In both cases drain it directly in the loop.
+    const stdin_polled = blk: {
+        var st: c.Stat = undefined;
+        if (c.fstat(posix.STDIN_FILENO, &st) == 0 and c.S.ISREG(@as(u32, st.mode))) break :blk false;
+        var stdin_change = [1]c.Kevent{makeKevent(@intCast(posix.STDIN_FILENO), c.EVFILT.READ, c.EV.ADD, 0, 0, UDATA_STDIN)};
+        break :blk keventCall(kq, &stdin_change, &no_events, null) >= 0;
+    };
     // Buffers
     const buf_size = 1024;
     var stdout_buf: [buf_size]u8 = undefined;
@@ -65,8 +68,12 @@ pub fn run(
     // Event buffer
     var events: [8]c.Kevent = undefined;
     var no_changes: [0]c.Kevent = undefined;
+    const zero_ts = c.timespec{ .sec = 0, .nsec = 0 };
     while (true) {
-        const nevents = keventCall(kq, &no_changes, &events);
+        // Non-pollable stdin produces no events, so poll (0 timeout) to drain it
+        // below; otherwise block until an event arrives.
+        const draining_stdin = !stdin_polled and !stdin_closed and exit_code == null;
+        const nevents = keventCall(kq, &no_changes, &events, if (draining_stdin) &zero_ts else null);
         if (nevents < 0) {
             const err: posix.E = @enumFromInt(c._errno().*);
             if (err == .INTR) continue;
@@ -75,27 +82,42 @@ pub fn run(
         const event_count: usize = @intCast(nevents);
         for (events[0..event_count]) |ev| {
             if ((ev.flags & EV_ERROR) != 0) continue;
+            // Each stream drains all pending bytes before honoring EV_EOF: kqueue can
+            // deliver data and EOF in one event, so reading once would truncate.
             switch (udataInt(ev)) {
                 UDATA_STDOUT => {
-                    // Read available data first (kqueue can set EV_EOF with data still pending)
-                    if (ev.data > 0) {
-                        const n = posix.read(stdout_fd, &stdout_buf) catch {
+                    var remaining: usize = @intCast(ev.data);
+                    while (remaining > 0) {
+                        const want = @min(remaining, stdout_buf.len);
+                        const n = posix.read(stdout_fd, stdout_buf[0..want]) catch {
                             stdout_eof = true;
-                            continue;
+                            break;
                         };
-                        if (n > 0) platform.write(posix.STDOUT_FILENO, stdout_buf[0..n]);
+                        if (n == 0) {
+                            stdout_eof = true;
+                            break;
+                        }
+                        platform.write(posix.STDOUT_FILENO, stdout_buf[0..n]);
+                        remaining -= n;
                     }
                     if ((ev.flags & EV_EOF) != 0 or ev.data == 0) {
                         stdout_eof = true;
                     }
                 },
                 UDATA_STDERR => {
-                    if (ev.data > 0) {
-                        const n = posix.read(stderr_fd, &stderr_buf) catch {
+                    var remaining: usize = @intCast(ev.data);
+                    while (remaining > 0) {
+                        const want = @min(remaining, stderr_buf.len);
+                        const n = posix.read(stderr_fd, stderr_buf[0..want]) catch {
                             stderr_eof = true;
-                            continue;
+                            break;
                         };
-                        if (n > 0) platform.write(posix.STDERR_FILENO, stderr_buf[0..n]);
+                        if (n == 0) {
+                            stderr_eof = true;
+                            break;
+                        }
+                        platform.write(posix.STDERR_FILENO, stderr_buf[0..n]);
+                        remaining -= n;
                     }
                     if ((ev.flags & EV_EOF) != 0 or ev.data == 0) {
                         stderr_eof = true;
@@ -103,18 +125,19 @@ pub fn run(
                 },
                 UDATA_STDIN => {
                     if (exit_code != null or stdin_closed) continue;
-                    // Read pending data first (kqueue can set EV_EOF with data still pending)
-                    if (ev.data > 0) {
-                        const n = posix.read(posix.STDIN_FILENO, &stdin_buf) catch 0;
-                        if (n > 0) {
-                            if (sync_mode and !signal_parser.worker_wants_raw) {
-                                for (stdin_buf[0..n]) |byte| {
-                                    cooked_state.process(byte, stdin_fd);
-                                }
-                            } else {
-                                platform.write(stdin_fd, stdin_buf[0..n]);
+                    var remaining: usize = @intCast(ev.data);
+                    while (remaining > 0) {
+                        const want = @min(remaining, stdin_buf.len);
+                        const n = posix.read(posix.STDIN_FILENO, stdin_buf[0..want]) catch 0;
+                        if (n == 0) break;
+                        if (sync_mode and !signal_parser.worker_wants_raw) {
+                            for (stdin_buf[0..n]) |byte| {
+                                cooked_state.process(byte, stdin_fd);
                             }
+                        } else {
+                            platform.write(stdin_fd, stdin_buf[0..n]);
                         }
+                        remaining -= n;
                     }
                     // Close stdin socket on local stdin EOF so worker sees EOF
                     if ((ev.flags & EV_EOF) != 0) {
@@ -123,24 +146,37 @@ pub fn run(
                     }
                 },
                 UDATA_SIGNALS => {
+                    var remaining: usize = @intCast(ev.data);
+                    while (remaining > 0) {
+                        const want = @min(remaining, signals_buf.len);
+                        const n = posix.read(signals_fd, signals_buf[0..want]) catch {
+                            if (exit_code == null) exit_code = 1;
+                            break;
+                        };
+                        if (n == 0) break;
+                        switch (signal_parser.feed(signals_buf[0..n], signals_fd)) {
+                            .exit => |code| exit_code = code,
+                            .none => {},
+                        }
+                        remaining -= n;
+                    }
                     if ((ev.flags & EV_EOF) != 0) {
                         if (exit_code == null) exit_code = 1;
-                        continue;
-                    }
-                    const n = posix.read(signals_fd, &signals_buf) catch {
-                        if (exit_code == null) exit_code = 1;
-                        continue;
-                    };
-                    if (n == 0) {
-                        if (exit_code == null) exit_code = 1;
-                        continue;
-                    }
-                    switch (signal_parser.feed(signals_buf[0..n], signals_fd)) {
-                        .exit => |code| exit_code = code,
-                        .none => {},
                     }
                 },
                 else => {},
+            }
+        }
+        // Drain non-pollable stdin directly; read()==0 is EOF, so close to signal it.
+        if (!stdin_polled and !stdin_closed and exit_code == null) {
+            const n = posix.read(posix.STDIN_FILENO, &stdin_buf) catch 0;
+            if (n == 0) {
+                platform.close(stdin_fd);
+                stdin_closed = true;
+            } else if (sync_mode and !signal_parser.worker_wants_raw) {
+                for (stdin_buf[0..n]) |byte| cooked_state.process(byte, stdin_fd);
+            } else {
+                platform.write(stdin_fd, stdin_buf[0..n]);
             }
         }
         // Exit only when we have exit code AND both output streams are drained
@@ -171,6 +207,6 @@ fn udataInt(ev: c.Kevent) usize {
     return ev.udata;
 }
 /// Wrapper for kevent syscall using slices
-fn keventCall(kq: posix.fd_t, changelist: []const c.Kevent, eventlist: []c.Kevent) c_int {
-    return c.kevent(kq, changelist.ptr, @intCast(changelist.len), eventlist.ptr, @intCast(eventlist.len), null);
+fn keventCall(kq: posix.fd_t, changelist: []const c.Kevent, eventlist: []c.Kevent, timeout: ?*const c.timespec) c_int {
+    return c.kevent(kq, changelist.ptr, @intCast(changelist.len), eventlist.ptr, @intCast(eventlist.len), timeout);
 }

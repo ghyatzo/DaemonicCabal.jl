@@ -21,12 +21,21 @@ pub const getpid = linux.getpid;
 pub const getppid = linux.getppid;
 
 // I/O — write wraps the raw syscall to take a slice and log errors.
+// Loops until the whole buffer is written, as a single write() can be short.
 pub fn write(fd: posix.fd_t, buf: []const u8) void {
-    const rc = linux.write(fd, buf.ptr, buf.len);
-    const signed: isize = @bitCast(rc);
-    if (signed < 0) {
-        @branchHint(.cold);
-        std.debug.print("write error on fd {}: {}\n", .{ fd, @as(linux.E, @enumFromInt(@as(u16, @intCast(-signed)))) });
+    var written: usize = 0;
+    while (written < buf.len) {
+        const rc = linux.write(fd, buf.ptr + written, buf.len - written);
+        const signed: isize = @bitCast(rc);
+        if (signed < 0) {
+            @branchHint(.cold);
+            const e = @as(linux.E, @enumFromInt(@as(u16, @intCast(-signed))));
+            if (e == .INTR) continue;
+            std.debug.print("write error on fd {}: {}\n", .{ fd, e });
+            return;
+        }
+        if (signed == 0) return; // no progress; avoid spinning
+        written += @intCast(signed);
     }
 }
 

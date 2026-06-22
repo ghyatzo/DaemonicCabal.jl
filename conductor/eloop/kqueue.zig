@@ -296,7 +296,7 @@ fn handlePongReady(conductor: *Conductor, kq: posix.fd_t, w: *worker.Worker) voi
     // Cancel timeout timer (may fail if already fired - that's fine)
     var changes = [1]c.Kevent{makeKevent(@intFromPtr(w), c.EVFILT.TIMER, c.EV.DELETE, 0, 0, 0)};
     _ = keventSubmit(kq, &changes);
-    // Read pong into worker's own buffer (socket is ready, but may need multiple reads for full 7 bytes)
+    // Read pong into worker's own buffer (socket is ready, but may need multiple reads for the full 5 bytes)
     const n = posix.read(w.socket, &w.pong_buf) catch |err| {
         std.debug.print("Worker {d}: pong read error: {}\n", .{ w.id, err });
         conductor.killUnresponsiveWorker(w);
