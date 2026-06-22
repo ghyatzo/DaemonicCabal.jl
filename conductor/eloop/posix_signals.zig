@@ -8,6 +8,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const posix = std.posix;
 const Io = std.Io;
+const platform = @import("../platform/main.zig");
 
 pub const SIGNAL_SHUTDOWN: u8 = 'S';
 pub const SIGNAL_RECREATE: u8 = 'R';
@@ -52,7 +53,7 @@ pub fn installSignalHandlers() !void {
 
 /// Close signal pipe. Call after event loop exits.
 pub fn cleanupSignalHandlers() void {
-    if (signal_pipe[0] != -1) posix.close(signal_pipe[0]);
-    if (signal_pipe[1] != -1) posix.close(signal_pipe[1]);
+    if (signal_pipe[0] != -1) platform.close(signal_pipe[0]);
+    if (signal_pipe[1] != -1) platform.close(signal_pipe[1]);
     signal_pipe = .{ -1, -1 };
 }

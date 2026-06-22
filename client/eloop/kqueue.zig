@@ -118,7 +118,7 @@ pub fn run(
                     }
                     // Close stdin socket on local stdin EOF so worker sees EOF
                     if ((ev.flags & EV_EOF) != 0) {
-                        posix.close(stdin_fd);
+                        platform.close(stdin_fd);
                         stdin_closed = true;
                     }
                 },

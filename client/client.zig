@@ -218,7 +218,7 @@ fn scanEnv(block: EnvBlock) EnvInfo {
         .{ "XDG_RUNTIME_DIR=", "xdg_runtime_dir" },
         .{ "HOME=", "home" },
     };
-    for (block) |entry_opt| {
+    for (block.slice) |entry_opt| {
         const entry = entry_opt orelse break;
         const kv = std.mem.span(entry);
         if (std.mem.startsWith(u8, kv, "HYPERFINE_")) continue; // benchmarking noise
@@ -375,7 +375,7 @@ fn connectToWorker(conductor: Io.net.Stream, w: *SocketWriter, env: EnvInfo, blo
 
 fn sendFullEnv(w: *SocketWriter, env: EnvInfo, block: EnvBlock) void {
     w.writeInt(u16, env.count);
-    for (block) |entry_opt| {
+    for (block.slice) |entry_opt| {
         const kv = std.mem.span(entry_opt orelse break);
         if (std.mem.startsWith(u8, kv, "HYPERFINE_")) continue;
         const eq = std.mem.indexOfScalar(u8, kv, '=') orelse continue;

@@ -40,6 +40,9 @@ pub fn rawWaitpid(pid: posix.pid_t) posix.pid_t {
 pub fn rawIoctl(fd: posix.fd_t, request: anytype, arg: usize) usize {
     return linux.ioctl(fd, request, arg);
 }
+pub fn rawClose(fd: posix.fd_t) void {
+    _ = linux.close(fd);
+}
 
 // Network — check if a sockaddr is a loopback address
 pub fn isLoopback(addr: *const posix.sockaddr, addr_len: posix.socklen_t) bool {

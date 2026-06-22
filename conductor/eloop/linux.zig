@@ -113,7 +113,7 @@ pub fn run(conductor: *Conductor, server: *Io.net.Server) void {
                         conductor.handleConnectionFd(client_fd, &peer) catch |err| {
                             std.debug.print("Client handling failed: {}\n", .{err});
                         };
-                        posix.close(client_fd);
+                        platform.close(client_fd);
                     } else {
                         const err_code: u32 = @intCast(-cqe.res);
                         if (err_code != @intFromEnum(posix.E.BADF)) {
