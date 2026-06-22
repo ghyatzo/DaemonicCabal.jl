@@ -25,19 +25,21 @@ Switches (a '*' marks the default value, if applicable):
 
 Client-specific switches:
 
+ -a, --address <addr>       Connect to conductor at <addr> instead of default
  --session[=<label>]        Reuse worker state in Main module. With a label,
                             multiple clients can share the same session.
  --sync                     Attach to shared REPL (requires --session=<label>)
  --revise[=yes|no*]         Enable or disable Revise.jl integration
  --restart                  Kill workers for the project and exit
  --sandbox                  Run in an isolated sandbox (Linux only)
+ --status[=json]            Show the state of the workers, optionally in json
 
 Daemon management (systemd):
 
  systemctl --user {start | stop | restart | status} julia-daemon
 #+end_example
 
-Supported platforms: Linux, macOS, BSD.
+Supported platforms: Linux, macOS, FreeBSD, and OpenBSD.
 
 * Usage
 
@@ -55,11 +57,8 @@ By default, each =juliaclient= invocation runs in a fresh module. Use
 ~$ juliaclient --session -e 'println(x)'  # prints 42
 #+end_example
 
-Without a label, session affinity is based on the parent process (shell), so
-different terminal windows tend to get separate sessions (this is not
-guaranteed).
-
-With a label, multiple clients can explicitly share the same session:
+Without a label, session affinity is based on the parent process (shell).
+With a label, multiple clients share the same session:
 
 #+begin_example
 # Terminal A
@@ -129,38 +128,69 @@ Remote clients on non-Linux platforms are rejected.
 
 Environment variables read at daemon startup:
 
-| Variable                       | Default                      | Description                                                     |
-|--------------------------------+------------------------------+-----------------------------------------------------------------|
-| =JULIA_DAEMON_RUNTIME=           | /(platform-specific)/          | Runtime directory for sockets and PID file                      |
-| =JULIA_DAEMON_SERVER=            | =<runtime_dir>/conductor.sock= | Socket path or =tcp://host:port= for TCP mode                  |
-| =JULIA_DAEMON_BIND=              | /(from server addr)/           | TCP bind address override (e.g. =0.0.0.0=)                     |
-| =JULIA_DAEMON_PORTS=             | /unset/                        | Worker port range in TCP mode (e.g. =10000-10100=)              |
-| =JULIA_DAEMON_WORKER_EXECUTABLE= | =julia=                        | Julia binary for workers                                        |
-| =JULIA_DAEMON_WORKER_ARGS=       | =--startup-file=no=            | Arguments passed to worker processes (split on whitespace)      |
-| =JULIA_DAEMON_WORKER_PROJECT=    | /(required)/                   | Project for the worker itself (not client projects)             |
-| =JULIA_DAEMON_WORKER_MAXCLIENTS= | =1=                            | Max clients per worker (0 = unlimited)                          |
-| =JULIA_DAEMON_WORKER_TTL=        | =7200=                         | Worker idle timeout in seconds (2 hours)                        |
-| =JULIA_DAEMON_LABEL_TTL=         | =90=                           | Session label retention after last client disconnects (seconds) |
-| =JULIA_DAEMON_PING_INTERVAL=     | =30=                           | Health check interval (seconds)                                 |
-| =JULIA_DAEMON_PING_TIMEOUT=      | =5=                            | Ping timeout before killing unresponsive worker (seconds)       |
-| =JULIA_DAEMON_REVISE=            | =no=                           | Enable Revise.jl by default (also settable with =--revise=)     |
+| Variable                       | Default                      | Description                                                                                                                      |
+|--------------------------------+------------------------------+----------------------------------------------------------------------------------------------------------------------------------|
+| =JULIA_DAEMON_RUNTIME=           | /(platform-specific)/          | Runtime directory for sockets and PID file                                                                                       |
+| =JULIA_DAEMON_SERVER=            | =<runtime_dir>/conductor.sock= | Socket path or =tcp://host:port= for TCP mode                                                                                      |
+| =JULIA_DAEMON_BIND=              | /(from server addr)/           | TCP bind address override (e.g. =0.0.0.0=)                                                                                         |
+| =JULIA_DAEMON_PORTS=             | /unset/                        | Worker port range in TCP mode (e.g. =10000-10100=)                                                                                 |
+| =JULIA_DAEMON_WORKER_EXECUTABLE= | =julia=                        | Julia binary for workers                                                                                                         |
+| =JULIA_DAEMON_WORKER_ARGS=       | =--startup-file=no=            | Arguments passed to worker processes (split on whitespace)                                                                       |
+| =JULIA_DAEMON_WORKER_PROJECT=    | /(required)/                   | Project for the worker itself (not client projects)                                                                              |
+| =JULIA_DAEMON_WORKER_MAXCLIENTS= | =1=                            | Max clients per worker (0 = unlimited)                                                                                           |
+| =JULIA_DAEMON_MAX_TTL=           | =7200=                         | Idle worker deadline in seconds; always culled past this (2h). Supersedes =JULIA_DAEMON_WORKER_TTL=, falling back to it when unset |
+| =JULIA_DAEMON_MIN_TTL=           | =120=                          | Protected floor: idle workers younger than this are never evicted under memory pressure                                          |
+| =JULIA_DAEMON_LABEL_TTL=         | =90=                           | Session label retention after last client disconnects (seconds)                                                                  |
+| =JULIA_DAEMON_PING_INTERVAL=     | =30=                           | Health check interval (seconds)                                                                                                  |
+| =JULIA_DAEMON_PING_TIMEOUT=      | =5=                            | Ping timeout before killing unresponsive worker (seconds)                                                                        |
+| =JULIA_DAEMON_REVISE=            | =no=                           | Enable Revise.jl by default (also settable with =--revise=)                                                                        |
+
+Memory-pressure eviction:
+
+| Variable                     | Default | Description                                                                 |
+|------------------------------+---------+-----------------------------------------------------------------------------|
+| =JULIA_DAEMON_MEMORY_PRESSURE= | =1=       | Shed idle workers under host memory pressure (=0= to disable)                 |
+| =JULIA_DAEMON_PSI_THRESHOLD=   | =10.0=    | PSI =some avg10= % that counts as pressure (when PSI is the active source)    |
+| =JULIA_DAEMON_MEMFREE_LOW=     | =10%=     | Enter pressure below this free memory; =%= of total or absolute (=2G=)          |
+| =JULIA_DAEMON_MEMFREE_HIGH=    | =15%=     | Leave pressure above this free memory (hysteresis; must exceed =MEMFREE_LOW=) |
 
 Sandbox configuration (Linux only, applies to both =--sandbox= and remote clients):
 
-| Variable                                    | Default | Description                                                         |
-|---------------------------------------------+---------+---------------------------------------------------------------------|
-| =JULIA_DAEMON_SANDBOX_REMOTE_CLIENTS=       | =1=     | Sandbox remote (non-loopback) TCP clients (=0= to disable)         |
-| =JULIA_DAEMON_SANDBOX_EMPTY_ENVIRONMENT=    | =1=     | Mask =~/.julia/environments= in sandbox (=0= to expose host envs) |
-| =JULIA_DAEMON_SANDBOX_MAX_MEMORY=           | /unset/ | Per-sandbox cgroup memory limit (e.g. =4G=, =512M=)               |
-| =JULIA_DAEMON_SANDBOX_MAX_CPU=              | /unset/ | Per-sandbox cgroup CPU limit as percentage (e.g. =200= = 2 cores)  |
-| =JULIA_DAEMON_SANDBOX_SESSION_BYPASS=       | =0=     | Allow remote =--session=<label>= to join local unsandboxed workers |
+| Variable                               | Default | Description                                                      |
+|----------------------------------------+---------+------------------------------------------------------------------|
+| =JULIA_DAEMON_SANDBOX_REMOTE_CLIENTS=    | =1=       | Sandbox remote (non-loopback) TCP clients (=0= to disable)         |
+| =JULIA_DAEMON_SANDBOX_EMPTY_ENVIRONMENT= | =1=       | Mask =~/.julia/environments= in sandbox (=0= to expose host envs)    |
+| =JULIA_DAEMON_SANDBOX_MAX_MEMORY=        | /unset/   | Per-sandbox cgroup memory limit (e.g. =4G=, =512M=)                  |
+| =JULIA_DAEMON_SANDBOX_MAX_CPU=           | /unset/   | Per-sandbox cgroup CPU limit as percentage (e.g. =200= = 2 cores)  |
+| =JULIA_DAEMON_SANDBOX_SESSION_BYPASS=    | =0=       | Allow remote =--session=<label>= to join local unsandboxed workers |
 
 Runtime directory defaults: Linux =/run/user/$UID/julia-daemon=, macOS
-=~/Library/Application Support/julia-daemon=, BSD =/tmp/julia-daemon-$UID=,
-Windows =%LOCALAPPDATA%\julia-daemon=.
+=~/Library/Application Support/julia-daemon=, BSD =/tmp/julia-daemon-$UID=.
 
 The client reads =JULIA_DAEMON_SERVER= and =JULIA_DAEMON_RUNTIME= to locate the
 conductor socket.
+
+* Memory pressure
+
+Idle workers are large (a warmed Julia process is hundreds of MB), so on a busy
+or shared host the conductor treats them as a memory-pressure-reactive cache:
+when the host runs low on memory it sheds the least valuable idle workers,
+leaving them alone while RAM is plentiful. This is on by default; set
+=JULIA_DAEMON_MEMORY_PRESSURE=0= for TTL-only behaviour.
+
+A worker is eligible for eviction only once it has been idle past =MIN_TTL= (a
+recently-used worker is never culled), and the conductor evicts the
+lowest-value-per-byte first --- a worker kept warm by frequent or long-running
+use ranks above a cold one, and a large worker yields before a small one of
+equal warmth. Eviction never touches a worker with a connected client. An
+evicted worker simply cold-starts on its next invocation, exactly as it would
+after its idle =MAX_TTL= deadline.
+
+Pressure is read from the kernel's PSI stall information where available, else
+from the free-memory level (=MemAvailable=). On FreeBSD only the pressure trigger
+is implemented (workers are ranked without a size term); OpenBSD is TTL-only.
+=juliaclient --status= shows each idle worker's eviction warmth while pressure
+handling is active.
 
 * Architecture
 
