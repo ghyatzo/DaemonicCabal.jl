@@ -176,7 +176,7 @@ pub const Worker = struct {
         var magic_buf: [4]u8 = undefined;
         std.mem.writeInt(u32, &magic_buf, protocol.worker.magic, .little);
         platform.write(socket, &magic_buf);
-        const now = (Io.Clock.now(.awake, io) catch Io.Timestamp{ .nanoseconds = 0 }).toSeconds();
+        const now = Io.Clock.now(.awake, io).toSeconds();
         return .{
             .allocator = allocator,
             .id = id,
@@ -203,7 +203,7 @@ pub const Worker = struct {
     pub fn deinit(self: *Worker) void {
         if (self.project) |p| self.allocator.free(p);
         if (self.session_label) |l| self.allocator.free(l);
-        posix.close(self.socket);
+        platform.close(self.socket);
     }
 
     fn writeHeader(self: *Worker, msg_type: protocol.worker.MessageType, payload_len: u16) void {

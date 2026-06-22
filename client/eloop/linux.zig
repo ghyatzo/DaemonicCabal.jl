@@ -71,7 +71,7 @@ pub fn run(
                 },
                 @intFromEnum(Location.local_stdin) => {
                     if (cqe.res <= 0) {
-                        posix.close(stdin_fd);
+                        platform.close(stdin_fd);
                         continue;
                     }
                     if (exit_code != null) continue;

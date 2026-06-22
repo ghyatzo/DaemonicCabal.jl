@@ -969,7 +969,7 @@ pub const Conductor = struct {
     // --- Client tracking ---
 
     fn registerClient(self: *Conductor, pid: u32, client_num: u32, w: *worker.Worker, port_set: u16) !void {
-        const now_us: i64 = @intCast(@divTrunc((Io.Clock.now(.awake, self.io) catch Io.Timestamp{ .nanoseconds = 0 }).nanoseconds, 1000));
+        const now_us: i64 = @intCast(@divTrunc(Io.Clock.now(.awake, self.io).nanoseconds, 1000));
         try self.active_clients.put(pid, .{ .worker = w, .client_num = client_num, .start_time_us = now_us, .port_set = port_set });
     }
 
@@ -978,7 +978,7 @@ pub const Conductor = struct {
             const info = entry.value;
             self.releasePortSet(info.port_set);
             if (info.worker.active_clients > 0) info.worker.active_clients -= 1;
-            const now_us: i64 = @intCast(@divTrunc((Io.Clock.now(.awake, self.io) catch Io.Timestamp{ .nanoseconds = 0 }).nanoseconds, 1000));
+            const now_us: i64 = @intCast(@divTrunc(Io.Clock.now(.awake, self.io).nanoseconds, 1000));
             info.worker.last_active = @divTrunc(now_us, 1_000_000);
             const duration_us = now_us - info.start_time_us;
             const duration_s: u64 = @intCast(@divTrunc(duration_us, 1_000_000));

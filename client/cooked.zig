@@ -58,7 +58,7 @@ pub const CookedState = struct {
         if (builtin.os.tag == .windows) {
             _ = std.os.windows.ws2_32.closesocket(fd);
         } else {
-            posix.close(fd);
+            platform.close(fd);
         }
     }
 };

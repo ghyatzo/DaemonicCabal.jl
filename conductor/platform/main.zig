@@ -46,6 +46,7 @@ pub fn getStderrHandle() std.posix.fd_t {
 const shared = if (os != .windows) @import("posix.zig") else impl;
 pub const socketWrite = shared.socketWrite;
 pub const socketRead = shared.socketRead;
+pub const close = shared.close;
 pub const getChildPid = shared.getChildPid;
 pub const WaitPidResult = shared.WaitPidResult;
 pub const waitpidNonBlocking = shared.waitpidNonBlocking;
@@ -58,5 +59,5 @@ pub const setRawMode = if (os != .windows) shared.setRawModeStdin else impl.setR
 
 // Time (common implementation)
 pub fn timeSeconds(io: Io) i64 {
-    return (Io.Clock.now(.awake, io) catch Io.Timestamp{ .nanoseconds = 0 }).toSeconds();
+    return Io.Clock.now(.awake, io).toSeconds();
 }

@@ -244,17 +244,29 @@ fn parseHostPort(addr: []const u8) !Io.net.IpAddress {
 }
 
 pub fn connectAddress(io_ctx: Io, mode: TransportMode, addr: []const u8) !Io.net.Stream {
-    return switch (mode) {
-        .unix => (try Io.net.UnixAddress.init(addr)).connect(io_ctx),
-        .tcp => Io.net.IpAddress.connect(try parseHostPort(addr), io_ctx, .{ .mode = .stream }),
-    };
+    switch (mode) {
+        .unix => {
+            const ua = try Io.net.UnixAddress.init(addr);
+            return ua.connect(io_ctx);
+        },
+        .tcp => {
+            const ip = try parseHostPort(addr);
+            return ip.connect(io_ctx, .{ .mode = .stream });
+        },
+    }
 }
 
 pub fn listenAddress(io_ctx: Io, mode: TransportMode, addr: []const u8) !Io.net.Server {
-    return switch (mode) {
-        .unix => (try Io.net.UnixAddress.init(addr)).listen(io_ctx, .{ .kernel_backlog = 128 }),
-        .tcp => Io.net.IpAddress.listen(try parseHostPort(addr), io_ctx, .{ .kernel_backlog = 128, .reuse_address = true }),
-    };
+    switch (mode) {
+        .unix => {
+            const ua = try Io.net.UnixAddress.init(addr);
+            return ua.listen(io_ctx, .{ .kernel_backlog = 128 });
+        },
+        .tcp => {
+            const ip = try parseHostPort(addr);
+            return ip.listen(io_ctx, .{ .kernel_backlog = 128, .reuse_address = true });
+        },
+    }
 }
 
 pub const Listener = struct { server: Io.net.Server, addr: []const u8 };
@@ -280,7 +292,7 @@ pub fn createListener(
 /// Port 0 = ephemeral (OS-assigned).
 pub fn listenTcp(io_ctx: Io, bind_addr: []const u8, port: u16, buf: []u8) !Listener {
     const ip = Io.net.IpAddress.parse(bind_addr, port) catch return error.InvalidAddress;
-    var server = try Io.net.IpAddress.listen(ip, io_ctx, .{ .reuse_address = true });
+    var server = try ip.listen(io_ctx, .{ .reuse_address = true });
     const actual_port = switch (server.socket.address) {
         .ip4 => |a| a.port,
         .ip6 => |a| a.port,

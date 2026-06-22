@@ -43,6 +43,9 @@ pub fn rawIoctl(fd: posix.fd_t, request: anytype, arg: usize) usize {
     const ret = c.ioctl(fd, @intCast(request), arg);
     return if (ret < 0) 1 else 0;
 }
+pub fn rawClose(fd: posix.fd_t) void {
+    _ = c.close(fd);
+}
 
 // Network — check if a sockaddr is a loopback address
 pub fn isLoopback(addr: *const posix.sockaddr, addr_len: posix.socklen_t) bool {

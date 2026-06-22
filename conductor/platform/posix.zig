@@ -19,6 +19,7 @@ pub fn print(out: anytype, comptime fmt: []const u8, args: anytype) ![]const u8 
 
 // I/O — on POSIX, sockets are fds.
 pub fn socketWrite(fd: posix.socket_t, buf: []const u8) void { impl.write(fd, buf); }
+pub fn close(fd: posix.fd_t) void { impl.rawClose(fd); }
 pub fn socketRead(fd: posix.socket_t, buf: []u8) usize {
     return posix.read(fd, buf) catch |err| {
         @branchHint(.cold);
