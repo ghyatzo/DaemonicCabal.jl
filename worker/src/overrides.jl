@@ -26,24 +26,6 @@
         term.have_truecolor = has_truecolor
     end
 
-    @eval function REPL.Terminals.raw!(t::REPL.TTYTerminal, raw::Bool)
-        term = ACTIVE_TERM[]
-        session = term.sync_session
-        if !isnothing(session)
-            for sig in session.signals
-                isopen(sig) || continue
-                try
-                    send_signal(sig, SIGNAL_RAW_MODE, UInt8[raw])
-                    read(sig, 2)  # ack
-                catch end
-            end
-        elseif isopen(term.signals)
-            send_signal(term.signals, SIGNAL_RAW_MODE, UInt8[raw])
-            read(term.signals, 2)  # ack: id(1) + len(1), len=0
-        end
-        raw
-    end
-
     @eval function Base.display_error(io::IO, stack::Base.ExceptionStack)
         if !isempty(stack) && first(stack).exception isa DaemonClientExit
             exit = first(stack).exception
@@ -65,11 +47,6 @@
             println(io)
         end
     end
-else
-    # With `REPL.Terminals.raw!`, there are two invocations incompatible
-    # with an `IOContext`: `check_open` and `.handle`. However, `raw!` isn't
-    # able to work normally anyway, so we may as well override it.
-    @eval REPL.Terminals.raw!(t::REPL.TTYTerminal, raw::Bool) = raw
 end
 
 # Override active_module to use the per-client scoped module for REPL
@@ -107,6 +84,73 @@ end
         end
     end
     pushfirst!(Base.repl_hooks, repl -> CLIENT_REPL[][] = repl)
+end
+
+# Tell the client to flip its terminal between raw (REPL reading input) and cooked
+# (code executing) via the signals socket.
+@static if VERSION >= v"1.11"
+    @eval function REPL.Terminals.raw!(t::REPL.TTYTerminal, raw::Bool)
+        term = ACTIVE_TERM[]
+        if !isnothing(term.sync_session)
+            for sig in term.sync_session.signals
+                isopen(sig) || continue
+                try
+                    send_signal(sig, SIGNAL_RAW_MODE, UInt8[raw])
+                    read(sig, 2) # ack
+                catch end
+            end
+        elseif isopen(term.signals)
+            send_signal(term.signals, SIGNAL_RAW_MODE, UInt8[raw])
+            read(term.signals, 2) # ack
+        end
+        raw
+    end
+else
+    @eval function REPL.Terminals.raw!(t::REPL.TTYTerminal, raw::Bool)
+        sig = CLIENT_SIGNALS[]
+        if sig !== nothing && isopen(sig)
+            try
+                send_signal(sig, SIGNAL_RAW_MODE, UInt8[raw])
+                read(sig, 2) # ack
+            catch end
+        end
+        raw
+    end
+end
+
+# A near-copy of `REPL.repl_backend_loop`, modified to catch InterruptException from `take!` and retry.
+# A real TTY would stop emitting SIGINT as soon as the prompt goes raw, but it's entirely possible
+# for the client to have more interrupts in-flight.
+@eval REPL function repl_backend_loop(backend::REPLBackend, get_module::Function)
+    while true
+        tls = task_local_storage()
+        tls[:SOURCE_PATH] = nothing
+        local ast_or_func, show_value
+        while true
+            try
+                ast_or_func, show_value = take!(backend.repl_channel)
+                break
+            catch e
+                e isa InterruptException || rethrow()
+            end
+        end
+        if show_value == -1
+            break
+        end
+        @static if VERSION >= v"1.11"
+            if show_value == 2 # 2 indicates a function to be called
+                f = ast_or_func
+                try
+                    ret = f()
+                    put!(backend.response_channel, Pair{Any, Bool}(ret, false))
+                catch
+                    put!(backend.response_channel, Pair{Any, Bool}(current_exceptions(), true))
+                end
+                continue
+            end
+        end
+        eval_user_input(ast_or_func, backend, get_module())
+    end
 end
 
 @eval Base.exit(n) = throw(DaemonClientExit(n))

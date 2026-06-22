@@ -268,6 +268,20 @@ pub const Conductor = struct {
                     if (!w.ping_pending) self.event_loop.scheduleHealthCheck(w);
                 }
             },
+            .client_interrupt => {
+                if (self.active_clients.get(pid)) |info| {
+                    // Two-pronged interrupt:
+                    // 1. Protocol message: cooperative InterruptException delivery
+                    //    via schedule() — works for yielding tasks (sleep, I/O, etc.)
+                    // 2. SIGINT to worker process: triggers Julia's C-level force-throw
+                    //    accumulator — needed for tight loops (while true end).
+                    //    Single SIGINT won't force-throw; rapid Ctrl-C accumulates
+                    //    ~4-6 SIGINTs to cross the threshold, matching julia's behavior.
+                    info.worker.sendInterrupt(pid);
+                    if (info.worker.process.id) |wpid|
+                        _ = platform.kill(wpid, platform.SIG.INT);
+                }
+            },
             .worker_unresponsive => std.debug.print("Worker unresponsive notification for pid {d}\n", .{pid}),
             .worker_exit => {
                 if (self.findWorkerIdByPid(pid)) |id| {

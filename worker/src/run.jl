@@ -92,8 +92,13 @@ function runclient(client::ClientInfo, client_stdin::StreamIO,
     try
         withenv(client.env...) do
             @static if VERSION < v"1.11"
-                redirect_stdio(stdin=client_stdin, stdout=stdoutx, stderr=stderrx) do
-                    runclient(mod, client; stdout=stdoutx)
+                CLIENT_SIGNALS[] = signals
+                try
+                    redirect_stdio(stdin=client_stdin, stdout=stdoutx, stderr=stderrx) do
+                        runclient(mod, client; stdout=stdoutx)
+                    end
+                finally
+                    CLIENT_SIGNALS[] = nothing
                 end
             else
                 term = get(ENV, "TERM", @static if Sys.iswindows() "" else "dumb" end)

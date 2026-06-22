@@ -70,22 +70,42 @@ pub fn setRawMode(stdin: posix.fd_t, raw: bool) void {
 }
 
 // Signal handling
+//
+// Worker raw mode tracking: the worker toggles the client's terminal between
+// raw mode (REPL reading input) and cooked mode (code executing) via the
+// signals socket. This flag tracks the worker's intent so the SIGINT handler
+// can choose the right path — write \x03 to stdin (raw/REPL) or send an
+// interrupt notification via the conductor (cooked/executing).
+var worker_raw: bool = false;
+pub fn setWorkerRawMode(raw: bool) void { worker_raw = raw; }
 pub const SignalHandler = struct {
     sockets_ptr: *anyopaque,
     write_fn: *const fn (*anyopaque, []const u8) void,
     notify_exit_fn: *const fn () void,
+    notify_interrupt_fn: *const fn () void,
     pub fn writeStdio(self: SignalHandler, data: []const u8) void {
         self.write_fn(self.sockets_ptr, data);
     }
     pub fn notifyExit(self: SignalHandler) void {
         self.notify_exit_fn();
     }
+    pub fn notifyInterrupt(self: SignalHandler) void {
+        self.notify_interrupt_fn();
+    }
 };
 var g_signal_handler: ?SignalHandler = null;
 fn signalAction(sig: posix.SIG, _: *const posix.siginfo_t, _: ?*anyopaque) callconv(.c) void {
     const handler = g_signal_handler orelse return;
     switch (sig) {
-        .INT => handler.writeStdio("\x03"),
+        .INT => {
+            // In raw mode the REPL is reading input — \x03 triggers LineEdit's ^C binding.
+            // In cooked mode code is executing — route through the conductor to deliver
+            // InterruptException to the running task.
+            if (worker_raw)
+                handler.writeStdio("\x03")
+            else
+                handler.notifyInterrupt();
+        },
         .TERM => {
             handler.notifyExit();
             std.process.exit(128 + @intFromEnum(posix.SIG.TERM));
@@ -101,7 +121,7 @@ pub fn registerSignalHandlers(handler: SignalHandler) void {
     const sigact = posix.Sigaction{
         .handler = .{ .sigaction = signalAction },
         .mask = mask,
-        .flags = 0,
+        .flags = 0, // No SA_RESTART: let io_uring submit_and_wait return EINTR promptly
     };
     posix.sigaction(posix.SIG.INT, &sigact, null);
     posix.sigaction(posix.SIG.TERM, &sigact, null);

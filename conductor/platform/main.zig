@@ -56,6 +56,9 @@ pub const isatty = shared.isatty;
 pub const SignalHandler = shared.SignalHandler;
 pub const registerSignalHandlers = shared.registerSignalHandlers;
 pub const setRawMode = if (os != .windows) shared.setRawModeStdin else impl.setRawMode;
+pub const setWorkerRawMode = if (os != .windows) shared.setWorkerRawMode else struct {
+    fn f(_: bool) void {}
+}.f;
 
 // Time (common implementation)
 pub fn timeSeconds(io: Io) i64 {

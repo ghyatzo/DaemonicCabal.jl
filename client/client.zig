@@ -125,6 +125,7 @@ const SignalParser = struct {
             protocol.signals.exit => .{ .exit = if (data.len >= 1) data[0] else 1 },
             protocol.signals.raw_mode => blk: {
                 if (data.len == 1) {
+                    platform.setWorkerRawMode(data[0] != 0);
                     if (self.sync_mode) {
                         // In sync mode, track worker's desired state but stay in raw mode
                         self.worker_wants_raw = data[0] != 0;
@@ -177,11 +178,16 @@ fn signalNotifyExit() void {
     platform.setRawMode(false);
 }
 
+fn signalNotifyInterrupt() void {
+    notifyInterruptRaw();
+}
+
 fn registerSignalHandlers() void {
     platform.registerSignalHandlers(.{
         .sockets_ptr = @ptrCast(&sockets),
         .write_fn = &signalWriteStdin,
         .notify_exit_fn = &signalNotifyExit,
+        .notify_interrupt_fn = &signalNotifyInterrupt,
     });
 }
 
@@ -450,6 +456,87 @@ fn notifyExit() void {
     buf[4] = @intFromEnum(protocol.notification.Type.client_exit);
     std.mem.writeInt(u32, buf[5..9], @intCast(platform.getpid()), .little);
     platform.socketWrite(stream.socket.handle, &buf);
+}
+
+/// Signal-handler-safe interrupt notification using raw POSIX syscalls.
+/// Connects to the conductor, sends a client_interrupt notification, and closes.
+/// Uses raw syscalls (not std.Io) to avoid corrupting io_uring state.
+/// Silently returns on any error — the \x03 stdin path provides the fallback.
+fn notifyInterruptRaw() void {
+    const linux = std.os.linux;
+    var buf: [9]u8 = undefined;
+    std.mem.writeInt(u32, buf[0..4], protocol.notification.magic, .little);
+    buf[4] = @intFromEnum(protocol.notification.Type.client_interrupt);
+    std.mem.writeInt(u32, buf[5..9], @intCast(platform.getpid()), .little);
+    switch (transport_mode) {
+        .unix => {
+            const fd = rawSocket(linux.AF.UNIX, linux.SOCK.STREAM) orelse return;
+            defer rawClose(fd);
+            var addr = std.mem.zeroes(linux.sockaddr.un);
+            addr.family = linux.AF.UNIX;
+            if (conductor_path.len > addr.path.len) return;
+            @memcpy(addr.path[0..conductor_path.len], conductor_path);
+            if (rawConnect(fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.un))) {
+                rawWrite(fd, &buf);
+            }
+        },
+        .tcp => {
+            // Parse host:port from conductor_path
+            const colon = std.mem.lastIndexOfScalar(u8, conductor_path, ':') orelse return;
+            const host = conductor_path[0..colon];
+            const port = std.fmt.parseInt(u16, conductor_path[colon + 1 ..], 10) catch return;
+            // Only support IPv4 loopback/simple addresses from signal handler
+            const ip = parseIPv4(host) orelse return;
+            const fd = rawSocket(linux.AF.INET, linux.SOCK.STREAM) orelse return;
+            defer rawClose(fd);
+            var addr = std.mem.zeroes(posix.sockaddr.in);
+            addr.family = linux.AF.INET;
+            addr.port = std.mem.nativeToBig(u16, port);
+            addr.addr = ip;
+            if (rawConnect(fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.in))) {
+                rawWrite(fd, &buf);
+            }
+        },
+    }
+}
+
+// Raw syscall helpers for signal-handler-safe operations
+fn rawSocket(family: u32, sock_type: u32) ?posix.fd_t {
+    const linux = std.os.linux;
+    const rc = linux.socket(family, sock_type | linux.SOCK.CLOEXEC, 0);
+    const signed: isize = @bitCast(rc);
+    return if (signed >= 0) @intCast(signed) else null;
+}
+
+fn rawConnect(fd: posix.fd_t, addr: *const posix.sockaddr, len: posix.socklen_t) bool {
+    const linux = std.os.linux;
+    const rc = linux.connect(fd, addr, len);
+    const signed: isize = @bitCast(rc);
+    return signed == 0;
+}
+
+fn rawWrite(fd: posix.fd_t, data: []const u8) void {
+    const linux = std.os.linux;
+    _ = linux.write(fd, data.ptr, data.len);
+}
+
+fn rawClose(fd: posix.fd_t) void {
+    const linux = std.os.linux;
+    _ = linux.close(fd);
+}
+
+/// Parse a dotted-decimal IPv4 address into a u32 (network byte order).
+fn parseIPv4(host: []const u8) ?u32 {
+    var parts: [4]u8 = undefined;
+    var i: usize = 0;
+    var it = std.mem.splitScalar(u8, host, '.');
+    while (it.next()) |part| {
+        if (i >= 4) return null;
+        parts[i] = std.fmt.parseInt(u8, part, 10) catch return null;
+        i += 1;
+    }
+    if (i != 4) return null;
+    return @bitCast(parts);
 }
 
 fn getTerminalSize() struct { height: u16, width: u16 } {
