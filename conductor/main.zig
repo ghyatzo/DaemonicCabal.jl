@@ -79,7 +79,7 @@ const CLIENT_HELP =
     \\
     \\ -v, --version              Display version information
     \\ -h, --help                 Print this message
-    \\ --project[=<dir>|@.]       Set <dir> as the home project/environment
+    \\ -P, --project[=<dir>|@.]    Set <dir> as the home project/environment
     \\ -e, --eval <expr>          Evaluate <expr>
     \\ -E, --print <expr>         Evaluate <expr> and display the result
     \\ -L, --load <file>          Load <file> immediately on all processors
