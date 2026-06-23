@@ -62,6 +62,9 @@ function prepare_module(client::ClientInfo)
     if getval(client.switches, "--revise", get(ENV, "JULIA_DAEMON_REVISE", "no")) ∈ ("yes", "true", "1", "")
         if isdefined(Main, :Revise)
             Main.Revise.revise()
+        elseif !isnothing(Base.locate_package(REVISE_PKG))
+            Core.eval(Main, :(using Revise))
+            Main.Revise.revise()
         end
     end
     mod

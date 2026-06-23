@@ -34,7 +34,9 @@ const REVISE_PKG =
     Base.PkgId(Base.UUID("295af30f-e4ad-537b-8983-00126c2a3abe"), "Revise")
 
 function try_load_revise()
-    if !isnothing(Base.locate_package(REVISE_PKG))
+    get(ENV, "JULIA_DAEMON_REVISE", "no") ∈ ("yes", "true", "1", "") || return
+    isdefined(Main, :Revise) && return
+    if !isdefined(Main, :Revise) && !isnothing(Base.locate_package(REVISE_PKG))
         Core.eval(Main, :(using Revise))
     end
 end
