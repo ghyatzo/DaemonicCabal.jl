@@ -26,6 +26,7 @@ pub const Worker = struct {
     socket: posix.socket_t,
     project: ?[]const u8,
     julia_channel: ?[]const u8,
+    threads: args.Threads,
     session_label: ?[]const u8,
     created_at: i64,
     last_active: i64,
@@ -45,9 +46,10 @@ pub const Worker = struct {
         id: u32,
         runtime_dir: []const u8,
         julia_channel: ?[]const u8,
+        threads: args.Threads,
         interactive: bool,
     ) !Worker {
-        return spawnImpl(allocator, io, cfg, id, runtime_dir, julia_channel, interactive, false, null, &.{}, &.{});
+        return spawnImpl(allocator, io, cfg, id, runtime_dir, julia_channel, threads, interactive, false, null, &.{}, &.{});
     }
 
     pub fn spawnSandboxed(
@@ -57,11 +59,12 @@ pub const Worker = struct {
         id: u32,
         runtime_dir: []const u8,
         julia_channel: ?[]const u8,
+        threads: args.Threads,
         environ_map: *const std.process.Environ.Map,
         extra_ro_binds: []const []const u8,
         extra_rw_binds: []const []const u8,
     ) !Worker {
-        return spawnImpl(allocator, io, cfg, id, runtime_dir, julia_channel, false, true, environ_map, extra_ro_binds, extra_rw_binds);
+        return spawnImpl(allocator, io, cfg, id, runtime_dir, julia_channel, threads, false, true, environ_map, extra_ro_binds, extra_rw_binds);
     }
 
     fn spawnImpl(
@@ -71,6 +74,7 @@ pub const Worker = struct {
         id: u32,
         runtime_dir: []const u8,
         julia_channel: ?[]const u8,
+        threads: args.Threads,
         interactive: bool,
         sandboxed: bool,
         environ_map: ?*const std.process.Environ.Map,
@@ -101,6 +105,13 @@ pub const Worker = struct {
             .{ setup.addr, id, cfg.socket_path },
         );
         defer allocator.free(eval_expr);
+        // Rendered once for both spawn paths. Passed after worker_args so a
+        // client request overrides any thread count in JULIA_DAEMON_WORKER_ARGS.
+        const threads_arg: ?[]const u8 = if (try args.renderThreads(allocator, threads)) |v| blk: {
+            defer allocator.free(v);
+            break :blk try std.fmt.allocPrint(allocator, "--threads={s}", .{v});
+        } else null;
+        defer if (threads_arg) |a| allocator.free(a);
         // Sandboxed spawn: fork+namespace+bind-mounts+exec (Linux only)
         var child: std.process.Child = undefined;
         if (sandboxed and builtin.os.tag == .linux) {
@@ -128,6 +139,7 @@ pub const Worker = struct {
             const sandbox_cfg = sandbox.SandboxConfig{
                 .julia_executable = exe_path,
                 .julia_channel = julia_channel,
+                .threads_arg = threads_arg,
                 .worker_project = cfg.worker_project,
                 .worker_args = cfg.worker_args,
                 .eval_expr = eval_expr,
@@ -164,6 +176,7 @@ pub const Worker = struct {
                 var it = std.mem.tokenizeScalar(u8, cfg.worker_args, ' ');
                 while (it.next()) |arg| try argv.append(arg);
             }
+            if (threads_arg) |a| try argv.append(a);
             if (interactive) try argv.append("-i");
             try argv.append("--eval");
             try argv.append(eval_expr);
@@ -188,6 +201,7 @@ pub const Worker = struct {
             .socket = socket,
             .project = null,
             .julia_channel = julia_channel,
+            .threads = threads,
             .session_label = null,
             .created_at = now,
             .last_active = now,

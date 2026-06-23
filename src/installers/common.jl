@@ -31,6 +31,9 @@ function daemon_env(; worker_maxclients::Integer, worker_ttl::Integer,
         "JULIA_DAEMON_WORKER_MAXCLIENTS" => string(worker_maxclients),
         "JULIA_DAEMON_WORKER_ARGS" => worker_args,
         "JULIA_DAEMON_WORKER_TTL" => string(worker_ttl))
+    if haskey(ENV, "JULIA_NUM_THREADS")
+        d["JULIA_NUM_THREADS"] = ENV["JULIA_NUM_THREADS"]
+    end
     if mode === :tcp
         d["JULIA_DAEMON_SERVER"] = "$conductor_host:$conductor_port"
         if !isempty(ports)

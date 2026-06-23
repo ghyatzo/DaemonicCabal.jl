@@ -359,13 +359,14 @@ pub const Conductor = struct {
         // Compute worker key and sandbox bind mounts
         const project_path = request.project orelse "";
         const julia_channel = request.parsed.julia_channel;
+        // Thread count is fixed at worker startup, so it's part of pool identity.
+        const threads = resolveThreads(&request);
+        const tkey = args.packThreads(threads);
+        const ch = julia_channel orelse "";
         var rw_binds: [1][]const u8 = undefined;
         const worker_key = switch (sandbox_mode) {
-            .none => try self.makeWorkerKey(project_path, julia_channel),
-            .remote => if (julia_channel) |ch|
-                try self.makeWorkerKey("__sandbox__", ch)
-            else
-                try self.allocator.dupe(u8, "__sandbox__"),
+            .none => try std.fmt.allocPrint(self.allocator, "{s}\x00{s}\x00{d}", .{ project_path, ch, tkey }),
+            .remote => try std.fmt.allocPrint(self.allocator, "__sandbox__\x00{s}\x00{d}", .{ ch, tkey }),
             .local => blk: {
                 const cwd = trimTrailingSlashes(request.cwd);
                 const proj = trimTrailingSlashes(project_path);
@@ -375,12 +376,9 @@ pub const Conductor = struct {
                 const has_local_project = proj.len > 0 and !is_named_env;
                 const rw_mount: []const u8 = if (has_local_project and pathCoveredBy(cwd, &.{proj})) proj else cwd;
                 rw_binds = .{rw_mount};
-                // Worker key encodes rw mount + project so workers only share
-                // when their mount configuration matches
-                break :blk if (julia_channel) |ch|
-                    try std.fmt.allocPrint(self.allocator, "__lsandbox__\x00{s}\x00{s}\x00{s}", .{ rw_mount, proj, ch })
-                else
-                    try std.fmt.allocPrint(self.allocator, "__lsandbox__\x00{s}\x00{s}", .{ rw_mount, proj });
+                // Key encodes rw mount + project so workers only share when their
+                // mount configuration matches.
+                break :blk try std.fmt.allocPrint(self.allocator, "__lsandbox__\x00{s}\x00{s}\x00{s}\x00{d}", .{ rw_mount, proj, ch, tkey });
             },
         };
         defer self.allocator.free(worker_key);
@@ -414,7 +412,7 @@ pub const Conductor = struct {
             return;
         }
         // Assign client to worker
-        try self.assignClientToWorker(socket, &request, worker_key, sandbox);
+        try self.assignClientToWorker(socket, &request, worker_key, threads, sandbox);
     }
 
     const ClientRequest = struct {
@@ -518,7 +516,7 @@ pub const Conductor = struct {
         local: []const []const u8, // rw bind mounts
     };
 
-    fn assignClientToWorker(self: *Conductor, socket: posix.socket_t, request: *const ClientRequest, worker_key: []const u8, sandbox: SandboxKind) !void {
+    fn assignClientToWorker(self: *Conductor, socket: posix.socket_t, request: *const ClientRequest, worker_key: []const u8, threads: args.Threads, sandbox: SandboxKind) !void {
         const list = try self.getWorkerList(worker_key);
         const session_label = request.parsed.getSwitch("--session");
         const is_labeled_session = session_label != null and session_label.?.len > 0;
@@ -556,7 +554,7 @@ pub const Conductor = struct {
             .port_set = port_set,
         };
         const now = self.currentTime();
-        const assignment = try self.selectWorker(list, &client_info, session_label, is_labeled_session, request.project orelse "", request.parsed.julia_channel, now, sandbox);
+        const assignment = try self.selectWorker(list, &client_info, session_label, is_labeled_session, request.project orelse "", request.parsed.julia_channel, threads, now, sandbox);
         std.debug.print("Assigned client {d} to worker {d}: {s}\n", .{ self.client_counter, assignment.w.id, @tagName(assignment.reason) });
         defer self.allocator.free(assignment.paths.stdin);
         defer self.allocator.free(assignment.paths.stdout);
@@ -628,6 +626,7 @@ pub const Conductor = struct {
         is_labeled_session: bool,
         project_path: []const u8,
         julia_channel: ?[]const u8,
+        threads: args.Threads,
         now: i64,
         sandbox: SandboxKind,
     ) !WorkerAssignment {
@@ -658,9 +657,9 @@ pub const Conductor = struct {
         }
         // 4. Spawn new worker
         const w = switch (sandbox) {
-            .none => try self.addWorkerToPool(list, project_path, julia_channel, want_interactive),
-            .remote => try self.addSandboxedWorkerToPool(list, project_path, julia_channel, &.{}),
-            .local => |rw_binds| try self.addSandboxedWorkerToPool(list, project_path, julia_channel, rw_binds),
+            .none => try self.addWorkerToPool(list, project_path, julia_channel, threads, want_interactive),
+            .remote => try self.addSandboxedWorkerToPool(list, project_path, julia_channel, threads, &.{}),
+            .local => |rw_binds| try self.addSandboxedWorkerToPool(list, project_path, julia_channel, threads, rw_binds),
         };
         if (is_labeled_session and w.session_label == null) {
             std.debug.print("Worker {d}: assigning label '{s}'\n", .{ w.id, session_label.? });
@@ -747,6 +746,10 @@ pub const Conductor = struct {
 
     pub fn createReserveWorker(self: *Conductor, julia_channel: ?[]const u8) !void {
         const w = try self.allocator.create(worker.Worker);
+        const reserve_threads = if (self.environ_map.get("JULIA_NUM_THREADS")) |v|
+            args.parseThreads(v)
+        else
+            args.threads_none;
         w.* = try worker.Worker.spawn(
             self.allocator,
             self.io,
@@ -754,6 +757,7 @@ pub const Conductor = struct {
             self.next_worker_id,
             self.cfg.runtime_dir,
             julia_channel,
+            reserve_threads,
             false, // reserve workers are never interactive
         );
         self.next_worker_id += 1;
@@ -762,11 +766,12 @@ pub const Conductor = struct {
         std.debug.print("Reserve worker {d} created (pid {d})\n", .{ w.id, platform.getChildPid(w.process) });
     }
 
-    fn addWorkerToPool(self: *Conductor, list: *WorkerList, proj: []const u8, julia_channel: ?[]const u8, interactive: bool) !*worker.Worker {
+    fn addWorkerToPool(self: *Conductor, list: *WorkerList, proj: []const u8, julia_channel: ?[]const u8, threads: args.Threads, interactive: bool) !*worker.Worker {
         const proj_copy = try self.allocator.dupe(u8, proj);
         errdefer self.allocator.free(proj_copy);
-        // Reserve worker is never interactive; only use it for non-interactive clients
+        // The reserve serves only a non-interactive request whose threads + channel match.
         const can_use_reserve = if (!interactive) (if (self.reserve) |r| blk: {
+            if (!std.meta.eql(threads, r.threads)) break :blk false;
             const reserve_ch = r.julia_channel;
             if (julia_channel == null and reserve_ch == null) break :blk true;
             if (julia_channel != null and reserve_ch != null)
@@ -793,6 +798,7 @@ pub const Conductor = struct {
                 self.next_worker_id,
                 self.cfg.runtime_dir,
                 julia_channel,
+                threads,
                 interactive,
             );
             std.debug.print("Spawning {s}worker {d} (pid {d}) for project {s}{s}{s}\n", .{
@@ -827,6 +833,7 @@ pub const Conductor = struct {
         list: *WorkerList,
         project_path: []const u8,
         julia_channel: ?[]const u8,
+        threads: args.Threads,
         rw_binds: []const []const u8,
     ) !*worker.Worker {
         const proj_copy = if (project_path.len > 0) try self.allocator.dupe(u8, project_path) else null;
@@ -845,6 +852,7 @@ pub const Conductor = struct {
             self.next_worker_id,
             self.cfg.runtime_dir,
             julia_channel,
+            threads,
             self.environ_map,
             proj_ro,
             rw_binds,
@@ -941,11 +949,13 @@ pub const Conductor = struct {
         }
     }
 
-    fn makeWorkerKey(self: *Conductor, proj: []const u8, julia_channel: ?[]const u8) ![]const u8 {
-        if (julia_channel) |ch| {
-            return try std.fmt.allocPrint(self.allocator, "{s}\x00{s}", .{ proj, ch });
+    fn resolveThreads(request: *const ClientRequest) args.Threads {
+        const sw = request.parsed.threadSwitch();
+        if (!std.meta.eql(sw, args.threads_none)) return sw;
+        for (request.env) |e| {
+            if (std.mem.eql(u8, e.key, "JULIA_NUM_THREADS")) return args.parseThreads(e.value);
         }
-        return try self.allocator.dupe(u8, proj);
+        return args.threads_none;
     }
 
     fn getWorkerList(self: *Conductor, key: []const u8) !*WorkerList {
