@@ -10,6 +10,7 @@ const main = @import("main.zig");
 const platform = @import("platform/main.zig");
 const config = @import("config.zig");
 const worker = @import("worker.zig");
+const argspec = @import("args.zig");
 
 const Conductor = main.Conductor;
 const Worker = worker.Worker;
@@ -293,6 +294,11 @@ fn renderWorker(c: *Conductor, w: Writer, s: Style, wk: *const Worker, now: i64,
         try w.writeAll(" (interactive)");
         col += 14;
     }
+    if (try argspec.renderThreads(c.allocator, wk.threads)) |t| {
+        defer c.allocator.free(t);
+        try w.print(" (threads={s})", .{t});
+        col += 11 + t.len;
+    }
     if (wk.sandboxed) {
         try w.writeAll(" (remote)");
         col += 9;
@@ -509,6 +515,10 @@ fn writeWorkerJson(c: *Conductor, w: Writer, wk: *const Worker, now: i64) !u64 {
     try writeJsonStringOrNull(w, wk.julia_channel);
     try w.writeAll(",\"session_label\":");
     try writeJsonStringOrNull(w, wk.session_label);
+    try w.writeAll(",\"threads\":");
+    const threads_str = try argspec.renderThreads(c.allocator, wk.threads);
+    defer if (threads_str) |t| c.allocator.free(t);
+    try writeJsonStringOrNull(w, threads_str);
     try w.print(",\"interactive\":{},\"sandboxed\":{}", .{ wk.interactive, wk.sandboxed });
     try w.print(",\"created_at\":{d},\"last_active\":{d},\"last_pinged\":{d}", .{ wk.created_at, wk.last_active, wk.last_pinged });
     try w.print(",\"ping_pending\":{},\"active_clients\":{d}", .{ wk.ping_pending, wk.active_clients });

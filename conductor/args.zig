@@ -10,6 +10,7 @@ const short_to_long = std.StaticStringMap([]const u8).initComptime(.{
     .{ "-E", "--print" },
     .{ "-L", "--load" },
     .{ "-P", "--project" },
+    .{ "-t", "--threads" },
 });
 
 const no_value_switches = std.StaticStringMap(void).initComptime(.{
@@ -60,7 +61,67 @@ pub const ParsedArgs = struct {
         }
         return false;
     }
+
+    /// The effective `--threads`/`-t` spec, or `threads_unset` if absent/empty.
+    pub fn threadSwitch(self: *const ParsedArgs) Threads {
+        return parseThreads(self.getSwitch("--threads") orelse "");
+    }
 };
+
+/// A Julia `--threads` spec as (default pool, interactive pool) counts.
+///
+/// Julia fixes thread counts at process startup, so this becomes part of a
+/// worker's identity: a client can only reuse a worker spawned with the same
+/// spec. Sentinels per field: `0` = unset (Julia default), `0xffff` = `auto`.
+/// A `[2]u16` compares directly and is cheap to use as a map key.
+pub const Threads = [2]u16;
+pub const threads_unset: u16 = 0;
+pub const threads_auto: u16 = 0xffff;
+pub const threads_none = Threads{ threads_unset, threads_unset };
+
+/// A single comparable value identifying a spec, for embedding in pool keys.
+pub fn packThreads(spec: Threads) u32 {
+    return (@as(u32, spec[0]) << 16) | spec[1];
+}
+
+/// Parse a `--threads` value (`N`, `auto`, `N,M`, `auto,M`). Unrecognised
+/// fields fall back to `auto`, leaving the final verdict to Julia at startup.
+pub fn parseThreads(value: []const u8) Threads {
+    if (value.len == 0) return threads_none;
+    const comma = std.mem.indexOfScalar(u8, value, ',');
+    const default = if (comma) |c| value[0..c] else value;
+    const interactive = if (comma) |c| value[c + 1 ..] else "";
+    return .{ parseThreadField(default), parseThreadField(interactive) };
+}
+
+fn parseThreadField(field: []const u8) u16 {
+    if (field.len == 0) return threads_unset;
+    if (std.mem.eql(u8, field, "auto")) return threads_auto;
+    return std.fmt.parseInt(u16, field, 10) catch threads_auto;
+}
+
+/// Render a spec as a `--threads` value (`3`, `auto`, `4,1`), or null when
+/// unset. Caller owns the result.
+pub fn renderThreads(allocator: Allocator, spec: Threads) !?[]const u8 {
+    if (spec[0] == threads_unset and spec[1] == threads_unset) return null;
+    // A u16 is at most 5 digits; "65535,65535" fits comfortably.
+    var buf: [16]u8 = undefined;
+    var d_buf: [8]u8 = undefined;
+    const default = threadField(&d_buf, spec[0]);
+    const rendered = if (spec[1] == threads_unset)
+        default
+    else blk: {
+        var i_buf: [8]u8 = undefined;
+        break :blk try std.fmt.bufPrint(&buf, "{s},{s}", .{ default, threadField(&i_buf, spec[1]) });
+    };
+    return try allocator.dupe(u8, rendered);
+}
+
+/// Format one field into `buf` as `auto` or a decimal count.
+fn threadField(buf: []u8, val: u16) []const u8 {
+    if (val == threads_auto or val == threads_unset) return "auto";
+    return std.fmt.bufPrint(buf, "{d}", .{val}) catch unreachable;
+}
 
 pub fn parse(allocator: Allocator, input_args: []const []const u8) !ParsedArgs {
     var switches = SwitchList.init(allocator);

@@ -43,6 +43,7 @@ pub const SandboxConfig = struct {
     // Process execution
     julia_executable: []const u8,
     julia_channel: ?[]const u8,
+    threads_arg: ?[]const u8,
     worker_project: []const u8,
     worker_args: []const u8,
     eval_expr: []const u8,
@@ -383,6 +384,8 @@ fn buildArgv(allocator: Allocator, config: *const SandboxConfig) ![:null]?[*:0]c
     var it = std.mem.tokenizeScalar(u8, config.worker_args, ' ');
     while (it.next()) |arg|
         try list.append(try allocator.dupeZ(u8, arg));
+    if (config.threads_arg) |t|
+        try list.append(try allocator.dupeZ(u8, t));
     try list.append(try allocator.dupeZ(u8, "--eval"));
     try list.append(try allocator.dupeZ(u8, config.eval_expr));
     const argv = try allocator.allocSentinel(?[*:0]const u8, list.items.len, null);
