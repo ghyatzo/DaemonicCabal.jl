@@ -9,6 +9,7 @@ const short_to_long = std.StaticStringMap([]const u8).initComptime(.{
     .{ "-e", "--eval" },
     .{ "-E", "--print" },
     .{ "-L", "--load" },
+    .{ "-P", "--project" },
 });
 
 const no_value_switches = std.StaticStringMap(void).initComptime(.{
