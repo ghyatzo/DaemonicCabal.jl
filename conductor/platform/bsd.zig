@@ -55,6 +55,13 @@ pub fn rawIoctl(fd: posix.fd_t, request: anytype, arg: usize) usize {
 pub fn rawClose(fd: posix.fd_t) void {
     _ = c.close(fd);
 }
+pub fn rawSocket(family: u32, sock_type: u32) ?posix.fd_t {
+    const rc = c.socket(@intCast(family), @intCast(sock_type), 0);
+    return if (rc >= 0) rc else null;
+}
+pub fn rawConnect(fd: posix.fd_t, addr: *const posix.sockaddr, len: posix.socklen_t) bool {
+    return c.connect(fd, addr, len) == 0;
+}
 
 // Network — check if a sockaddr is a loopback address
 pub fn isLoopback(addr: *const posix.sockaddr, addr_len: posix.socklen_t) bool {

@@ -463,21 +463,20 @@ fn notifyExit() void {
 /// Uses raw syscalls (not std.Io) to avoid corrupting io_uring state.
 /// Silently returns on any error — the \x03 stdin path provides the fallback.
 fn notifyInterruptRaw() void {
-    const linux = std.os.linux;
     var buf: [9]u8 = undefined;
     std.mem.writeInt(u32, buf[0..4], protocol.notification.magic, .little);
     buf[4] = @intFromEnum(protocol.notification.Type.client_interrupt);
     std.mem.writeInt(u32, buf[5..9], @intCast(platform.getpid()), .little);
     switch (transport_mode) {
         .unix => {
-            const fd = rawSocket(linux.AF.UNIX, linux.SOCK.STREAM) orelse return;
-            defer rawClose(fd);
-            var addr = std.mem.zeroes(linux.sockaddr.un);
-            addr.family = linux.AF.UNIX;
+            const fd = platform.rawSocket(posix.AF.UNIX, posix.SOCK.STREAM) orelse return;
+            defer platform.rawClose(fd);
+            var addr = std.mem.zeroes(posix.sockaddr.un);
+            addr.family = posix.AF.UNIX;
             if (conductor_path.len > addr.path.len) return;
             @memcpy(addr.path[0..conductor_path.len], conductor_path);
-            if (rawConnect(fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.un))) {
-                rawWrite(fd, &buf);
+            if (platform.rawConnect(fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.un))) {
+                platform.socketWrite(fd, &buf);
             }
         },
         .tcp => {
@@ -487,42 +486,17 @@ fn notifyInterruptRaw() void {
             const port = std.fmt.parseInt(u16, conductor_path[colon + 1 ..], 10) catch return;
             // Only support IPv4 loopback/simple addresses from signal handler
             const ip = parseIPv4(host) orelse return;
-            const fd = rawSocket(linux.AF.INET, linux.SOCK.STREAM) orelse return;
-            defer rawClose(fd);
+            const fd = platform.rawSocket(posix.AF.INET, posix.SOCK.STREAM) orelse return;
+            defer platform.rawClose(fd);
             var addr = std.mem.zeroes(posix.sockaddr.in);
-            addr.family = linux.AF.INET;
+            addr.family = posix.AF.INET;
             addr.port = std.mem.nativeToBig(u16, port);
             addr.addr = ip;
-            if (rawConnect(fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.in))) {
-                rawWrite(fd, &buf);
+            if (platform.rawConnect(fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.in))) {
+                platform.socketWrite(fd, &buf);
             }
         },
     }
-}
-
-// Raw syscall helpers for signal-handler-safe operations
-fn rawSocket(family: u32, sock_type: u32) ?posix.fd_t {
-    const linux = std.os.linux;
-    const rc = linux.socket(family, sock_type | linux.SOCK.CLOEXEC, 0);
-    const signed: isize = @bitCast(rc);
-    return if (signed >= 0) @intCast(signed) else null;
-}
-
-fn rawConnect(fd: posix.fd_t, addr: *const posix.sockaddr, len: posix.socklen_t) bool {
-    const linux = std.os.linux;
-    const rc = linux.connect(fd, addr, len);
-    const signed: isize = @bitCast(rc);
-    return signed == 0;
-}
-
-fn rawWrite(fd: posix.fd_t, data: []const u8) void {
-    const linux = std.os.linux;
-    _ = linux.write(fd, data.ptr, data.len);
-}
-
-fn rawClose(fd: posix.fd_t) void {
-    const linux = std.os.linux;
-    _ = linux.close(fd);
 }
 
 /// Parse a dotted-decimal IPv4 address into a u32 (network byte order).
