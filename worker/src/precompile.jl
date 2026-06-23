@@ -78,12 +78,14 @@ let
     sync_session_label(client)
     # create_module/prepare_module/runclient use Core.eval(Module(:Main), ...)
     # which is forbidden during precompilation — covered by explicit directives below
-    # -- Exercise BroadcastWriter ---------------------------------------------
-    bw = BroadcastWriter([IOBuffer(), IOBuffer()])
+    # -- Exercise BroadcastWriter + OutputHistory ----------------------------
+    history = OutputHistory(SYNC_HISTORY_BYTES)
+    bw = BroadcastWriter(IO[IOBuffer(), IOBuffer()], history)
     iswritable(bw); isopen(bw); isreadable(bw); bytesavailable(bw)
     write(bw, UInt8(0x41))
-    Base.unsafe_write(bw, pointer("test"), UInt(4))
+    Base.unsafe_write(bw, pointer("test\n"), UInt(5))
     flush(bw)
+    replay_history(IOBuffer(), history)
     # -- Exercise ScopedIO (>= 1.11) -----------------------------------------
     @static if VERSION >= v"1.11"
         scoped_out = ScopedStdout()

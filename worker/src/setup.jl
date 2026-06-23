@@ -262,10 +262,11 @@ function spawn_sync_client!(client::ClientInfo, client_stdin::StreamIO,
             # First interactive client: create session with merged stdin pipe
             pipe = Pipe()
             Base.link_pipe!(pipe; reader_supports_async=true, writer_supports_async=true)
+            history = OutputHistory(SYNC_HISTORY_BYTES)
             s = SyncSession(pipe.out, pipe.in,
-                            BroadcastWriter(StreamIO[client_stdout]),
-                            BroadcastWriter(StreamIO[client_stderr]),
-                            StreamIO[signals], 1, Ref{REPL.LineEditREPL}())
+                            BroadcastWriter(StreamIO[client_stdout], history),
+                            BroadcastWriter(StreamIO[client_stderr], history),
+                            StreamIO[signals], history, 1, Ref{REPL.LineEditREPL}())
             STATE.sync_sessions[label] = s
             s
         else
@@ -283,6 +284,11 @@ function spawn_sync_client!(client::ClientInfo, client_stdin::StreamIO,
             # keystrokes immediately instead of activating cooked emulation.
             send_signal(signals, SIGNAL_RAW_MODE, UInt8[true])
             read(signals, 2)
+            # Replay prior context, capped to a few screenfuls of the joiner's
+            # terminal; the live prompt is redrawn on top by the refresh below.
+            height = first(query_displaysize(signals))
+            maxlines = 3 * if iszero(height) 24 else height end
+            replay_history(client_stdout, existing.history; maxlines)
             # Position the new client's cursor so the REPL refresh
             # (which moves up curs_row-1 rows) lands correctly on a
             # fresh terminal, then trigger a redraw.
@@ -317,8 +323,8 @@ function spawn_sync_client!(client::ClientInfo, client_stdin::StreamIO,
         # Non-interactive with active session: clear the in-progress REPL
         # input on observers, run the eval, then restore the prompt.
         let existing = existing::SyncSession
-            out = BroadcastWriter(StreamIO[client_stdout; existing.out.writers])
-            err = BroadcastWriter(StreamIO[client_stderr; existing.err.writers])
+            out = BroadcastWriter(StreamIO[client_stdout; existing.out.writers], existing.history)
+            err = BroadcastWriter(StreamIO[client_stderr; existing.err.writers], existing.history)
             has_repl = isassigned(existing.repl) && existing.repl[].mistate !== nothing
             task = Threads.@spawn :interactive begin
                 # Clear the in-progress REPL input before eval output
