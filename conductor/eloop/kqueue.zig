@@ -299,13 +299,13 @@ fn handlePongReady(conductor: *Conductor, kq: posix.fd_t, w: *worker.Worker) voi
     // Read pong into worker's own buffer (socket is ready, but may need multiple reads for the full 5 bytes)
     const n = posix.read(w.socket, &w.pong_buf) catch |err| {
         std.debug.print("Worker {d}: pong read error: {}\n", .{ w.id, err });
-        conductor.killUnresponsiveWorker(w);
+        conductor.retireWorker(w);
         return;
     };
     if (n < 5) {
         protocol.readExact(w.socket, w.pong_buf[n..]) catch {
             std.debug.print("Worker {d}: pong short read\n", .{w.id});
-            conductor.killUnresponsiveWorker(w);
+            conductor.retireWorker(w);
             return;
         };
     }
@@ -320,7 +320,7 @@ fn handlePongTimeout(conductor: *Conductor, kq: posix.fd_t, w: *worker.Worker) v
     var changes = [1]c.Kevent{makeKevent(@intCast(w.socket), c.EVFILT.READ, c.EV.DELETE, 0, 0, 0)};
     _ = keventSubmit(kq, &changes);
     std.debug.print("Worker {d}: ping timed out\n", .{w.id});
-    conductor.killUnresponsiveWorker(w);
+    conductor.retireWorker(w);
 }
 
 // Helpers

@@ -284,8 +284,9 @@ pub const Conductor = struct {
             },
             .worker_unresponsive => std.debug.print("Worker unresponsive notification for pid {d}\n", .{pid}),
             .worker_exit => {
-                if (self.findWorkerIdByPid(pid)) |id| {
-                    std.debug.print("Worker {d} exiting (TTL expired)\n", .{id});
+                if (self.findWorkerByPid(pid)) |w| {
+                    std.debug.print("Worker {d} exiting (TTL expired)\n", .{w.id});
+                    self.retireWorker(w);
                 } else {
                     std.debug.print("Worker (pid {d}) exiting (TTL expired)\n", .{pid});
                 }
@@ -339,8 +340,7 @@ pub const Conductor = struct {
                     std.debug.print("Client {d}: session bypass — joining local worker {d} (label '{s}')\n", .{
                         self.client_counter, w.id, session_label.?,
                     });
-                    try self.assignClientToExistingWorker(socket, &request, w);
-                    return;
+                    if (try self.assignClientToExistingWorker(socket, &request, w)) return;
                 }
             }
         }
@@ -563,7 +563,9 @@ pub const Conductor = struct {
 
     /// Assign a remote client to an existing (already-selected) worker.
     /// Used for session bypass where the worker was found via global label search.
-    fn assignClientToExistingWorker(self: *Conductor, socket: posix.socket_t, request: *const ClientRequest, w: *worker.Worker) !void {
+    /// Returns false if the worker had already died and was retired, in which
+    /// case the caller should fall through to normal worker selection.
+    fn assignClientToExistingWorker(self: *Conductor, socket: posix.socket_t, request: *const ClientRequest, w: *worker.Worker) !bool {
         const port_set = if (self.port_pool) |*pool| blk: {
             break :blk pool.allocate() orelse {
                 std.debug.print("Client {d}: port pool exhausted\n", .{self.client_counter});
@@ -587,7 +589,11 @@ pub const Conductor = struct {
             .port_set = port_set,
         };
         self.event_loop.cancelPendingPing(w);
-        const paths = try w.runClient(self.allocator, &client_info);
+        const paths = w.runClient(self.allocator, &client_info) catch |err| {
+            if (!self.handleRunClientError(w, err)) return err;
+            self.releasePortSet(port_set);
+            return false;
+        };
         defer self.allocator.free(paths.stdin);
         defer self.allocator.free(paths.stdout);
         defer self.allocator.free(paths.stderr);
@@ -597,6 +603,7 @@ pub const Conductor = struct {
         w.recordPpid(request.ppid, self.cfg.worker_maxclients);
         try self.registerClient(request.pid, self.client_counter, w, port_set);
         self.sendSocketPaths(socket, paths);
+        return true;
     }
 
     // --- Worker selection ---
@@ -717,7 +724,7 @@ pub const Conductor = struct {
             },
             error.WouldBlock, error.EndOfStream, error.BrokenPipe, error.ConnectionResetByPeer,
             error.UnexpectedResponse, error.WorkerError => {
-                self.killUnresponsiveWorker(w);
+                self.retireWorker(w);
                 return true;
             },
             else => return false,
@@ -877,8 +884,11 @@ pub const Conductor = struct {
         return 0;
     }
 
-    pub fn killUnresponsiveWorker(self: *Conductor, w: *worker.Worker) void {
-        std.debug.print("Killing unresponsive worker {d}\n", .{w.id});
+    // Drop a worker from all conductor state and dispose of its process. Safe
+    // whether the worker is still alive (force-killed) or already self-exiting
+    // (SIGKILL no-ops, waitpid reaps it).
+    pub fn retireWorker(self: *Conductor, w: *worker.Worker) void {
+        self.event_loop.cancelPendingPing(w);
         if (self.reserve == w) self.reserve = null;
         self.removeActiveClientsForWorker(w);
         var it = self.workers.iterator();
@@ -890,7 +900,10 @@ pub const Conductor = struct {
                 }
             }
         }
-        if (w.process.id) |id| _ = platform.kill(id, platform.SIG.KILL);
+        if (w.process.id) |id| {
+            _ = platform.kill(id, platform.SIG.KILL);
+            _ = platform.waitpidNonBlocking(id);
+        }
         self.cleanupWorker(w);
     }
 
@@ -932,15 +945,15 @@ pub const Conductor = struct {
         return self.workers.getPtr(key).?;
     }
 
-    fn findWorkerIdByPid(self: *Conductor, pid: u32) ?u32 {
+    fn findWorkerByPid(self: *Conductor, pid: u32) ?*worker.Worker {
         var it = self.workers.iterator();
         while (it.next()) |entry| {
             for (entry.value_ptr.items) |w| {
-                if (platform.getChildPid(w.process) == pid) return w.id;
+                if (platform.getChildPid(w.process) == pid) return w;
             }
         }
         if (self.reserve) |r| {
-            if (platform.getChildPid(r.process) == pid) return r.id;
+            if (platform.getChildPid(r.process) == pid) return r;
         }
         return null;
     }
@@ -1035,7 +1048,7 @@ pub const Conductor = struct {
         }
         const remaining = w.syncClients(pids[0..count]) catch |err| {
             std.debug.print("Worker {d}: sync_clients failed: {}\n", .{ w.id, err });
-            self.killUnresponsiveWorker(w);
+            self.retireWorker(w);
             return;
         };
         w.active_clients = remaining;

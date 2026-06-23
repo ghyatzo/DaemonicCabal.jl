@@ -207,21 +207,21 @@ fn handlePongResponse(conductor: *Conductor, w: *worker.Worker, cqe_res: i32) vo
         if (w.ping_pending) {
             w.ping_pending = false;
             std.debug.print("Worker {d}: ping timed out\n", .{w.id});
-            conductor.killUnresponsiveWorker(w);
+            conductor.retireWorker(w);
         }
         return;
     }
     w.ping_pending = false;
     if (cqe_res <= 0) {
         std.debug.print("Worker {d}: ping failed (res={d})\n", .{ w.id, cqe_res });
-        conductor.killUnresponsiveWorker(w);
+        conductor.retireWorker(w);
         return;
     }
     const bytes_read: usize = @intCast(cqe_res);
     if (bytes_read < 5) {
         protocol.readExact(w.socket, w.pong_buf[bytes_read..]) catch {
             std.debug.print("Worker {d}: pong short read\n", .{w.id});
-            conductor.killUnresponsiveWorker(w);
+            conductor.retireWorker(w);
             return;
         };
     }
