@@ -615,9 +615,16 @@ pub const Conductor = struct {
         const want_interactive = for (client_info.switches) |sw| {
             if (std.mem.eql(u8, sw.name, "-i")) break true;
         } else false;
-        // 1. Labeled session: find worker with matching label
+        // 1. Labeled session: join its worker (global, or scoped to an explicit --project)
         if (is_labeled_session) {
-            if (findWorkerByLabel(list, session_label.?)) |w| {
+            const explicit_project = for (client_info.switches) |sw| {
+                if (std.mem.eql(u8, sw.name, "--project")) break true;
+            } else false;
+            const found = if (explicit_project)
+                findWorkerByLabel(list, session_label.?)
+            else
+                self.findWorkerByLabelGlobal(session_label.?);
+            if (found) |w| {
                 if (self.tryAssignWorker(w, client_info, .session_label)) |a| return a;
             }
         }
