@@ -556,6 +556,9 @@ pub const Conductor = struct {
         std.debug.print("Client {d}: sending socket paths to client\n", .{self.client_counter});
         self.sendSocketPaths(socket, assignment.paths);
         std.debug.print("Client {d}: done\n", .{self.client_counter});
+        if (self.reserve == null) self.createReserveWorker(null) catch |err| {
+            std.debug.print("Warning: failed to create reserve worker: {}\n", .{err});
+        };
     }
 
     /// Assign a remote client to an existing (already-selected) worker.
@@ -780,9 +783,6 @@ pub const Conductor = struct {
         self.event_loop.cancelPendingPing(w);
         try w.setProject(proj_copy);
         try list.append(self.allocator, w);
-        if (self.reserve == null) self.createReserveWorker(null) catch |err| {
-            std.debug.print("Warning: failed to create reserve worker: {}\n", .{err});
-        };
         return w;
     }
 
