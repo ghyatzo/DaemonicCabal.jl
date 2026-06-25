@@ -81,11 +81,9 @@ pub fn isLoopback(addr: *const posix.sockaddr, addr_len: posix.socklen_t) bool {
     return false;
 }
 
-// Read a /proc file into `buf`, returning the bytes read (null if unopenable).
-fn readProc(comptime fmt: []const u8, pid: posix.pid_t, buf: []u8) ?[]const u8 {
-    var path_buf: [64]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&path_buf, fmt, .{pid}) catch return null;
-    const fd_rc = linux.openat(linux.AT.FDCWD, path.ptr, .{ .ACCMODE = .RDONLY }, 0);
+// Read a file into `buf`, returning the bytes read (null if unopenable).
+fn readFile(path: [*:0]const u8, buf: []u8) ?[]const u8 {
+    const fd_rc = linux.openat(linux.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0);
     const fd_signed: isize = @bitCast(fd_rc);
     if (fd_signed < 0) return null;
     const fd: posix.fd_t = @intCast(fd_signed);
@@ -97,6 +95,12 @@ fn readProc(comptime fmt: []const u8, pid: posix.pid_t, buf: []u8) ?[]const u8 {
         total += @intCast(n);
     }
     return buf[0..total];
+}
+
+fn readProc(comptime fmt: []const u8, pid: posix.pid_t, buf: []u8) ?[]const u8 {
+    var path_buf: [64]u8 = undefined;
+    const path = std.fmt.bufPrintZ(&path_buf, fmt, .{pid}) catch return null;
+    return readFile(path.ptr, buf);
 }
 
 // The command name of `pid`'s parent process, copied into `out`. Resolves the
@@ -140,6 +144,46 @@ pub fn getProcessStats(pid: posix.pid_t) ?shared.ProcessStats {
         .rss_bytes = rss_pages * std.heap.pageSize(),
         .cpu_seconds = @as(f64, @floatFromInt(utime + stime)) / ticks_per_sec,
     };
+}
+
+// Reclaimable (USS) bytes from /proc/<pid>/smaps_rollup: Private_Clean +
+// Private_Dirty — the private pages freed when this process dies. Null if the
+// file is absent (very old kernels) or unparseable.
+pub fn processReclaimable(pid: posix.pid_t) ?u64 {
+    var buf: [4096]u8 = undefined;
+    const content = readProc("/proc/{d}/smaps_rollup", pid, &buf) orelse return null;
+    const clean = fieldKb(content, "Private_Clean:") orelse return null;
+    const dirty = fieldKb(content, "Private_Dirty:") orelse return null;
+    return (clean + dirty) * 1024;
+}
+
+// First numeric token after `field` in a "Field:  <n> kB"-style file, or null.
+fn fieldKb(content: []const u8, field: []const u8) ?u64 {
+    const start = std.mem.indexOf(u8, content, field) orelse return null;
+    var toks = std.mem.tokenizeAny(u8, content[start + field.len ..], " \n");
+    return std.fmt.parseInt(u64, toks.next() orelse return null, 10) catch null;
+}
+
+// --- Memory pressure sources ---
+
+// PSI "some avg10" %, or null if PSI is compiled out (common on stock distros).
+pub fn readPsiSomeAvg10() ?f64 {
+    var buf: [256]u8 = undefined;
+    const content = readFile("/proc/pressure/memory", &buf) orelse return null;
+    const some = std.mem.indexOf(u8, content, "some avg10=") orelse return null;
+    var toks = std.mem.tokenizeAny(u8, content[some + "some avg10=".len ..], " \n");
+    return std.fmt.parseFloat(f64, toks.next() orelse return null) catch null;
+}
+
+pub const MemInfo = struct { available: u64, total: u64 };
+
+// MemAvailable (excludes reclaimable cache) vs MemTotal. Always present on Linux.
+pub fn readMemInfo() ?MemInfo {
+    var buf: [2048]u8 = undefined;
+    const content = readFile("/proc/meminfo", &buf) orelse return null;
+    const total = fieldKb(content, "MemTotal:") orelse return null;
+    const avail = fieldKb(content, "MemAvailable:") orelse return null;
+    return .{ .available = avail * 1024, .total = total * 1024 };
 }
 
 // Paths — Linux-specific default runtime directory

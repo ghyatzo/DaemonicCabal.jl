@@ -14,6 +14,7 @@ const args = @import("args.zig");
 const project = @import("project.zig");
 const env_cache = @import("env_cache.zig");
 const status = @import("status.zig");
+const pressure = @import("pressure.zig");
 pub const worker = @import("worker.zig");
 
 /// Peer address info passed from the event loop's accept to connection handling.
@@ -103,6 +104,19 @@ const CLIENT_HELP =
     \\
 ++ DAEMON_MANAGEMENT_HELP;
 
+// --- Constants ---
+
+/// Grace per retirement stage; SIGTERM/SIGKILL fire only for a wedged worker.
+const retire_grace_s: i64 = 5;
+
+/// Max workers retired per eviction episode (bounds runaway culling under
+/// sustained exogenous pressure; see WORKER_CACHE.md §Bounding).
+const max_evict_per_episode: usize = 4;
+
+/// Upper bound on discretionary workers ranked per episode. Episodes that would
+/// exceed this rank only the first `episode_capacity` (logged), never silently.
+const episode_capacity: usize = 256;
+
 // --- Global state for cleanup ---
 
 pub var g_socket_path: [:0]const u8 = "";
@@ -120,6 +134,16 @@ pub const ActiveClientInfo = struct {
 };
 
 pub const ActiveClientMap = std.AutoHashMap(u32, ActiveClientInfo);
+
+/// A retiring worker awaiting reap; owns the `Worker` until then.
+pub const PendingKill = struct {
+    w: *worker.Worker,
+    pid: posix.pid_t,
+    stage: enum { soft, term },
+    deadline: i64,
+};
+
+pub const PendingKillList = std.array_list.Aligned(PendingKill, null);
 
 const AssignReason = enum {
     session_label,
@@ -148,6 +172,13 @@ pub const Conductor = struct {
     reserve: ?*worker.Worker,
     next_worker_id: u32,
     client_counter: u32,
+    /// Workers asked to exit, awaiting reap or escalation. Swept on the timer.
+    pending_kills: PendingKillList,
+    /// Per-pool-key combined recency+frequency (LRFU). Keyed like `workers`;
+    /// outlives every worker death except a max-TTL cull (see dropColdKey).
+    crf: std.StringHashMap(worker.Crf),
+    /// Host memory-pressure monitor (inert unless JULIA_DAEMON_MEMORY_PRESSURE).
+    pressure_monitor: pressure.Monitor,
     event_loop: eventLoopImpl.EventLoop,
 
     // --- Lifecycle ---
@@ -165,6 +196,9 @@ pub const Conductor = struct {
             .reserve = null,
             .next_worker_id = 1,
             .client_counter = 0,
+            .pending_kills = .empty,
+            .crf = std.StringHashMap(worker.Crf).init(allocator),
+            .pressure_monitor = pressure.Monitor.init(&cfg),
             .event_loop = try eventLoopImpl.EventLoop.init(64),
         };
     }
@@ -173,6 +207,15 @@ pub const Conductor = struct {
         self.event_loop.deinit();
         self.cache.deinit();
         self.active_clients.deinit();
+        for (self.pending_kills.items) |pk| {
+            _ = platform.kill(pk.pid, platform.SIG.KILL);
+            _ = platform.waitpidNonBlocking(pk.pid);
+            self.cleanupWorker(pk.w);
+        }
+        self.pending_kills.deinit(self.allocator);
+        var crf_it = self.crf.keyIterator();
+        while (crf_it.next()) |k| self.allocator.free(k.*);
+        self.crf.deinit();
         if (self.reserve) |r| self.cleanupWorker(r);
         var it = self.workers.iterator();
         while (it.next()) |entry| {
@@ -184,6 +227,18 @@ pub const Conductor = struct {
         if (g_socket_path.len > 0) self.allocator.free(g_socket_path);
         if (g_pid_path.len > 0) self.allocator.free(g_pid_path);
         self.cfg.deinit();
+    }
+
+    // Whether `w` is still in the pool/reserve. retireWorker removes a worker
+    // before it can be freed, so the event loops use this to drop stale
+    // completions rather than dereference freed (or recycled) memory.
+    pub fn isLiveWorker(self: *Conductor, w: *const worker.Worker) bool {
+        if (self.reserve == w) return true;
+        var it = self.workers.iterator();
+        while (it.next()) |entry| {
+            for (entry.value_ptr.items) |item| if (item == w) return true;
+        }
+        return false;
     }
 
     fn cleanupWorker(self: *Conductor, w: *worker.Worker) void {
@@ -563,6 +618,7 @@ pub const Conductor = struct {
         assignment.w.last_pinged = now;
         assignment.w.recordPpid(request.ppid, self.cfg.worker_maxclients);
         try self.registerClient(request.pid, self.client_counter, assignment.w, port_set);
+        self.bumpCrf(worker_key, now); // count the summons only once the client is tracked
         std.debug.print("Client {d}: sending socket paths to client\n", .{self.client_counter});
         self.sendSocketPaths(socket, assignment.paths);
         std.debug.print("Client {d}: done\n", .{self.client_counter});
@@ -893,20 +949,19 @@ pub const Conductor = struct {
         if (self.workers.getPtr(proj)) |list| {
             const count = list.items.len;
             for (list.items) |w| {
+                self.event_loop.cancelPendingPing(w);
+                if (self.reserve == w) self.reserve = null;
                 self.removeActiveClientsForWorker(w);
-                w.softExit();
-                self.cleanupWorker(w);
+                self.enqueueKill(w);
             }
-            list.deinit(self.allocator);
-            _ = self.workers.remove(proj);
+            // crf history is kept: --restart is a non-TTL death (may come back hot).
+            self.dropPoolEntry(proj);
             return count;
         }
         return 0;
     }
 
-    // Drop a worker from all conductor state and dispose of its process. Safe
-    // whether the worker is still alive (force-killed) or already self-exiting
-    // (SIGKILL no-ops, waitpid reaps it).
+    // Returns at once; the sweep escalates soft -> SIGTERM -> SIGKILL and reaps.
     pub fn retireWorker(self: *Conductor, w: *worker.Worker) void {
         self.event_loop.cancelPendingPing(w);
         if (self.reserve == w) self.reserve = null;
@@ -920,11 +975,233 @@ pub const Conductor = struct {
                 }
             }
         }
-        if (w.process.id) |id| {
-            _ = platform.kill(id, platform.SIG.KILL);
-            _ = platform.waitpidNonBlocking(id);
+        self.enqueueKill(w);
+    }
+
+    // Precondition: `w` is already detached from the pool.
+    fn enqueueKill(self: *Conductor, w: *worker.Worker) void {
+        const pid = w.process.id orelse {
+            self.cleanupWorker(w);
+            return;
+        };
+        w.softExit();
+        self.pending_kills.append(self.allocator, .{
+            .w = w, .pid = pid, .stage = .soft, .deadline = self.currentTime() + retire_grace_s,
+        }) catch {
+            _ = platform.kill(pid, platform.SIG.KILL);
+            _ = platform.waitpidNonBlocking(pid);
+            self.cleanupWorker(w);
+        };
+    }
+
+    // --- Activity signals ---
+
+    fn activityHalfLife(self: *const Conductor) u64 {
+        return self.cfg.min_ttl;
+    }
+
+    fn bumpCrf(self: *Conductor, key: []const u8, now: i64) void {
+        if (self.crf.getPtr(key)) |e| return e.summon(now, self.activityHalfLife());
+        const key_copy = self.allocator.dupe(u8, key) catch return;
+        self.crf.put(key_copy, .{ .last_update = now }) catch return self.allocator.free(key_copy);
+        self.crf.getPtr(key_copy).?.summon(now, self.activityHalfLife());
+    }
+
+    fn readCrf(self: *Conductor, key: []const u8, now: i64) f64 {
+        const e = self.crf.getPtr(key) orelse return 0;
+        return e.read(now, self.activityHalfLife());
+    }
+
+    // Eviction warmth of an idle worker: max(crf_norm, occupancy) in [0,1).
+    // `key` is the worker's pool key (null for the reserve, which has no crf).
+    // Pure, so safe to call from the status renderer.
+    pub fn workerActivity(self: *Conductor, w: *const worker.Worker, key: ?[]const u8, now: i64) f64 {
+        const crf_norm = if (key) |k| worker.Crf.normalize(self.readCrf(k, now)) else 0;
+        const occ = if (w.occupancy.busy) 0 else w.occupancy.read(now, self.activityHalfLife());
+        return @max(crf_norm, occ);
+    }
+
+    // Drop crf history. Only ever called for a TTL-culled key (gone cold); a
+    // crash/pressure death keeps the key for re-warming, and cleanupWorker — the
+    // shared death funnel — has no handle to the crf map, enforcing this.
+    fn dropColdKey(self: *Conductor, key: []const u8) void {
+        if (self.crf.fetchRemove(key)) |kv| self.allocator.free(kv.key);
+    }
+
+    // The conductor-owned idle policy: cull workers past max_ttl regardless of
+    // pressure, dropping the crf history of any key left cold.
+    pub fn enforceMaxTtl(self: *Conductor) void {
+        if (self.cfg.max_ttl == 0) return;
+        const now = self.currentTime();
+        // Re-scan from the top after each cull: retireWorker mutates the pool.
+        while (self.findExpired(now)) |hit| {
+            std.debug.print("Worker {d}: idle {d}s >= max TTL {d}s, retiring\n", .{ hit.w.id, now - hit.w.last_active, self.cfg.max_ttl });
+            self.retireWorker(hit.w);
+            // Order matters: both calls read hit.key, which dropPoolEntry frees,
+            // so dropColdKey (a content lookup) must run first.
+            if (hit.key) |key| {
+                if (self.workers.getPtr(key)) |list| {
+                    if (list.items.len == 0) {
+                        self.dropColdKey(key);
+                        self.dropPoolEntry(key);
+                    }
+                }
+            }
         }
-        self.cleanupWorker(w);
+    }
+
+    // Free a pool entry's list backing and map key (callers own any workers in
+    // it first; `key` dangles afterward).
+    fn dropPoolEntry(self: *Conductor, key: []const u8) void {
+        if (self.workers.fetchRemove(key)) |kv| {
+            var list = kv.value;
+            list.deinit(self.allocator);
+            self.allocator.free(kv.key);
+        }
+    }
+
+    const Expired = struct { w: *worker.Worker, key: ?[]const u8 };
+
+    // One at a time, so the caller can retire (mutating the pool) between calls.
+    fn findExpired(self: *Conductor, now: i64) ?Expired {
+        var it = self.workers.iterator();
+        while (it.next()) |entry| {
+            for (entry.value_ptr.items) |w| {
+                if (self.isExpired(w, now)) return .{ .w = w, .key = entry.key_ptr.* };
+            }
+        }
+        if (self.reserve) |r| {
+            if (self.isExpired(r, now)) return .{ .w = r, .key = null };
+        }
+        return null;
+    }
+
+    // --- Pressure-reactive eviction ---
+
+    const Candidate = struct { w: *worker.Worker, key: []const u8, size: u64, value: f64 };
+
+    // Under pressure: rank idle in-band workers by value() on cheap RSS, validate
+    // the lowest band with true USS, retire the lowest up to the cap.
+    pub fn runEvictionEpisode(self: *Conductor) void {
+        if (!self.pressure_monitor.poll(&self.cfg)) return;
+        const now = self.currentTime();
+        var buf: [episode_capacity]Candidate = undefined;
+        const cands = self.collectDiscretionary(&buf, now);
+        if (cands.len == 0) return;
+        // Selection pass: read current RSS and rank ascending by value(). An
+        // unreadable footprint (size 0) ranks by activity alone — see workerValue.
+        for (cands) |*c| {
+            if (c.w.process.id) |pid| {
+                if (platform.getProcessStats(pid)) |s| c.size = s.rss_bytes;
+            }
+            c.value = self.workerValue(c.w, c.key, now, c.size);
+        }
+        std.sort.pdq(Candidate, cands, {}, lessByValue);
+        // Validation pass: read true USS for the bottom 2*cap band, re-rank.
+        const band = @min(2 * max_evict_per_episode, cands.len);
+        for (cands[0..band]) |*c| {
+            if (c.w.process.id) |pid| {
+                if (platform.processReclaimable(pid)) |uss| c.size = uss;
+            }
+            c.value = self.workerValue(c.w, c.key, now, c.size);
+        }
+        std.sort.pdq(Candidate, cands[0..band], {}, lessByValue);
+        // Retire the true bottom, re-checking each is still a valid victim (the
+        // rank snapshot may predate an assignment from a prior CQE).
+        var evicted: usize = 0;
+        for (cands[0..band]) |c| {
+            if (evicted >= max_evict_per_episode) break;
+            if (!self.inPressureBand(c.w, now)) continue;
+            if (c.size == 0)
+                std.debug.print("Worker {d}: evicting under memory pressure (value={d:.5}, size n/a)\n", .{ c.w.id, c.value })
+            else
+                std.debug.print("Worker {d}: evicting under memory pressure (value={d:.5}, {d}MB)\n", .{ c.w.id, c.value, c.size >> 20 });
+            self.retireWorker(c.w);
+            evicted += 1;
+        }
+    }
+
+    // Idle in-band workers (+ the reserve), capped at episode_capacity.
+    fn collectDiscretionary(self: *Conductor, buf: []Candidate, now: i64) []Candidate {
+        var n: usize = 0;
+        var it = self.workers.iterator();
+        while (it.next()) |entry| {
+            for (entry.value_ptr.items) |w| {
+                if (n >= buf.len) {
+                    std.debug.print("Eviction episode: discretionary set exceeds cap; ranking first {d} only\n", .{buf.len});
+                    return buf[0..n];
+                }
+                if (self.inPressureBand(w, now)) {
+                    buf[n] = .{ .w = w, .key = entry.key_ptr.*, .size = 0, .value = 0 };
+                    n += 1;
+                }
+            }
+        }
+        // The keyless reserve (crf=0) is the cheapest thing to drop under pressure.
+        if (self.reserve) |r| {
+            if (n < buf.len and self.inPressureBand(r, now)) {
+                buf[n] = .{ .w = r, .key = "", .size = 0, .value = 0 };
+                n += 1;
+            }
+        }
+        return buf[0..n];
+    }
+
+    // Idle age of a cullable worker, or null if it has clients or a live label.
+    fn cullableAge(self: *Conductor, w: *worker.Worker, now: i64) ?u64 {
+        if (w.active_clients > 0) return null;
+        if (w.session_label != null and !self.isLabelExpired(w, now)) return null;
+        return @intCast(@max(0, now - w.last_active));
+    }
+    fn inPressureBand(self: *Conductor, w: *worker.Worker, now: i64) bool {
+        const age = self.cullableAge(w, now) orelse return false;
+        return age >= self.cfg.min_ttl and age < self.cfg.max_ttl;
+    }
+    fn isExpired(self: *Conductor, w: *worker.Worker, now: i64) bool {
+        const age = self.cullableAge(w, now) orelse return false;
+        return age >= self.cfg.max_ttl;
+    }
+
+    // value(w) = activity / size_MiB, evicted lowest-first. An unmeasured
+    // footprint (size 0: no /proc, or a platform without per-process stats)
+    // falls back to activity alone, so it ranks well above any measured worker
+    // and is spared rather than evicted on a fabricated size — and on a
+    // footprint-less platform all workers compare by activity uniformly.
+    fn workerValue(self: *Conductor, w: *worker.Worker, key: []const u8, now: i64, size_bytes: u64) f64 {
+        const activity_val = self.workerActivity(w, key, now);
+        if (size_bytes == 0) return activity_val;
+        return activity_val / (@as(f64, @floatFromInt(size_bytes)) / (1 << 20));
+    }
+
+    fn lessByValue(_: void, a: Candidate, b: Candidate) bool {
+        return a.value < b.value;
+    }
+
+    pub fn sweepPendingKills(self: *Conductor) void {
+        const now = self.currentTime();
+        var i: usize = 0;
+        while (i < self.pending_kills.items.len) {
+            var pk = &self.pending_kills.items[i];
+            if (platform.waitpidNonBlocking(pk.pid).exited) {
+                self.cleanupWorker(pk.w);
+                _ = self.pending_kills.swapRemove(i);
+                continue;
+            }
+            if (now >= pk.deadline) switch (pk.stage) {
+                .soft => {
+                    _ = platform.kill(pk.pid, platform.SIG.TERM);
+                    pk.stage = .term;
+                    pk.deadline = now + retire_grace_s;
+                },
+                .term => {
+                    _ = platform.kill(pk.pid, platform.SIG.KILL);
+                    self.cleanupWorker(pk.w);
+                    _ = self.pending_kills.swapRemove(i);
+                    continue;
+                },
+            };
+            i += 1;
+        }
     }
 
     fn removeActiveClientsForWorker(self: *Conductor, w: *worker.Worker) void {
@@ -1034,6 +1311,7 @@ pub const Conductor = struct {
 
     fn registerClient(self: *Conductor, pid: u32, client_num: u32, w: *worker.Worker, port_set: u16) !void {
         const now_us: i64 = @intCast(@divTrunc(Io.Clock.now(.awake, self.io).nanoseconds, 1000));
+        if (!w.occupancy.busy) w.occupancy.attach(@divTrunc(now_us, 1_000_000), self.activityHalfLife());
         try self.active_clients.put(pid, .{ .worker = w, .client_num = client_num, .start_time_us = now_us, .port_set = port_set });
     }
 
@@ -1043,7 +1321,9 @@ pub const Conductor = struct {
             self.releasePortSet(info.port_set);
             if (info.worker.active_clients > 0) info.worker.active_clients -= 1;
             const now_us: i64 = @intCast(@divTrunc(Io.Clock.now(.awake, self.io).nanoseconds, 1000));
-            info.worker.last_active = @divTrunc(now_us, 1_000_000);
+            const now_s = @divTrunc(now_us, 1_000_000);
+            info.worker.last_active = now_s;
+            if (info.worker.active_clients == 0) info.worker.occupancy.detach(now_s, self.activityHalfLife());
             const duration_us = now_us - info.start_time_us;
             const duration_s: u64 = @intCast(@divTrunc(duration_us, 1_000_000));
             const duration_ms: u64 = @intCast(@divTrunc(@mod(duration_us, 1_000_000), 1_000));
@@ -1074,6 +1354,12 @@ pub const Conductor = struct {
             return;
         };
         w.active_clients = remaining;
+        // Keep the occupancy busy/idle transition consistent with the synced count.
+        if (remaining == 0 and w.occupancy.busy) {
+            w.occupancy.detach(self.currentTime(), self.activityHalfLife());
+        } else if (remaining > 0 and !w.occupancy.busy) {
+            w.occupancy.attach(self.currentTime(), self.activityHalfLife());
+        }
         std.debug.print("Worker {d}: sync complete, {d} active clients\n", .{ w.id, remaining });
     }
 
@@ -1112,6 +1398,8 @@ pub const Conductor = struct {
         if (self.reserve) |r| {
             if (r.process.id) |id| _ = platform.kill(id, sig);
         }
+        // Workers mid-retirement are no longer in the pool but still dying.
+        for (self.pending_kills.items) |pk| _ = platform.kill(pk.pid, sig);
     }
 
     fn anyWorkerAlive(self: *Conductor) bool {
@@ -1124,6 +1412,9 @@ pub const Conductor = struct {
                     if (result.pid == 0) return true;
                 }
             }
+        }
+        for (self.pending_kills.items) |pk| {
+            if (!platform.waitpidNonBlocking(pk.pid).exited) return true;
         }
         if (self.reserve) |r| {
             if (r.process.id) |pid| {
@@ -1244,7 +1535,8 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print(" - Worker executable: {s}\n", .{cfg.worker_executable});
     std.debug.print(" - Worker args: {s}\n", .{cfg.worker_args});
     std.debug.print(" - Max clients per worker: {d}\n", .{cfg.worker_maxclients});
-    std.debug.print(" - Worker TTL: {d} seconds\n", .{cfg.worker_ttl});
+    std.debug.print(" - Idle TTL: {d}s (min {d}s), orphan failsafe {d}s\n", .{ cfg.max_ttl, cfg.min_ttl, cfg.max_ttl * 4 });
+    conductor.pressure_monitor.logResolution(&conductor.cfg);
     std.debug.print(" - Transport: {s}\n", .{@tagName(cfg.transport)});
     std.debug.print(" - Address: {s}\n", .{cfg.socket_path});
     if (cfg.port_range) |r| {

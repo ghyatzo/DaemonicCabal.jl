@@ -19,6 +19,72 @@ const createListener = protocol.createListener;
 
 const max_recent_ppids = 32;
 
+// --- Activity signals ---
+// Lazily-decayed eviction-warmth predictors, combined as max(crf_norm, occupancy).
+// Both decay 2^(-Δt/half_life) over real elapsed time, so sampling can be irregular.
+
+fn decay(dt_s: i64, half_life_s: u64) f64 {
+    if (half_life_s == 0) return 0;
+    return std.math.exp2(-@as(f64, @floatFromInt(dt_s)) / @as(f64, @floatFromInt(half_life_s)));
+}
+
+/// Combined recency+frequency (LRFU) for one pool key: summonses, each decaying.
+pub const Crf = struct {
+    value: f64 = 0,
+    last_update: i64 = 0,
+
+    pub fn summon(self: *Crf, now: i64, half_life_s: u64) void {
+        self.value = 1 + self.value * decay(now - self.last_update, half_life_s);
+        self.last_update = now;
+    }
+
+    /// Pure read for ranking — does not advance last_update.
+    pub fn read(self: *const Crf, now: i64, half_life_s: u64) f64 {
+        return self.value * decay(now - self.last_update, half_life_s);
+    }
+
+    /// Squash unbounded crf into [0,1) to compare with occupancy. c=2 places a
+    /// once-per-half-life cadence at 0.5; monotone, so ranking is unchanged.
+    pub fn normalize(value: f64) f64 {
+        return value / (value + 2.0);
+    }
+};
+
+/// PELT-style decayed busy-fraction for one worker. Folding on attach/detach is
+/// exact (not approximate) because the geometric EWMA is composable.
+pub const Occupancy = struct {
+    value: f64 = 0,
+    last_update: i64 = 0,
+    busy: bool = false,
+
+    // EWMA of the [last_update, now] interval: 1 if held during it, else 0
+    // (clamped OR, so overlapping clients never exceed 1).
+    fn fold(self: *Occupancy, now: i64, half_life_s: u64) void {
+        const dt = now - self.last_update;
+        if (dt <= 0) return;
+        const d = decay(dt, half_life_s);
+        self.value = (if (self.busy) 1 - d else 0) + self.value * d;
+        self.last_update = now;
+    }
+
+    pub fn attach(self: *Occupancy, now: i64, half_life_s: u64) void {
+        self.fold(now, half_life_s);
+        self.busy = true;
+    }
+
+    pub fn detach(self: *Occupancy, now: i64, half_life_s: u64) void {
+        self.fold(now, half_life_s);
+        self.busy = false;
+    }
+
+    /// Valid only when idle — assumes idleness since last_update, so a held
+    /// worker (hard-exempt from eviction) must never reach here.
+    pub fn read(self: *const Occupancy, now: i64, half_life_s: u64) f64 {
+        std.debug.assert(!self.busy);
+        return self.value * decay(now - self.last_update, half_life_s);
+    }
+};
+
 pub const Worker = struct {
     allocator: Allocator,
     id: u32,
@@ -34,6 +100,7 @@ pub const Worker = struct {
     ping_pending: bool = false,
     pong_buf: [5]u8 = undefined,
     active_clients: u32,
+    occupancy: Occupancy = .{},
     sandboxed: bool = false,
     interactive: bool = false,
     recent_ppids: [max_recent_ppids]u32 = .{0} ** max_recent_ppids,

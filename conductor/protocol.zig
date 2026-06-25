@@ -81,13 +81,14 @@ pub const signals = struct {
 };
 
 // Event user_data encoding for io_uring:
-// - Low values (0-3): fixed events (accept, signal, ping_timer, ignored)
+// - Low values (0-4): fixed events (accept, signal, ping_timer, ignored, pressure_timer)
 // - High values (>= 0x1000): worker pointer | tag (bit 0: 0=pong, 1=health check timeout)
 pub const EventLocation = enum(u64) {
     accept = 0,
     signal = 1,
     ping_timer = 2,
     ignored = 3, // For link_timeout completions we don't need to handle
+    pressure_timer = 4,
     _,
 };
 

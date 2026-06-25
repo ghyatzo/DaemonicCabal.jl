@@ -46,6 +46,19 @@ pub const ProcessStats = struct { rss_bytes: u64, cpu_seconds: f64 };
 pub const getProcessStats = impl.getProcessStats;
 pub const getParentName = impl.getParentName;
 
+/// Reclaimable (private) memory of a process in bytes — what killing it returns
+/// to the OS (USS). Null where the OS exposes no private-page accounting, in
+/// which case the caller falls back to RSS. Read on demand, never smoothed.
+pub const processReclaimable = impl.processReclaimable;
+
+/// Host memory-pressure sources, resolved per-OS. `readPsiSomeAvg10` is the
+/// preferred stall signal (null where PSI is unavailable); `readMemInfo` is the
+/// always-available free-memory level. No PSI on macOS/BSD (the level path is used);
+/// the level path works on Linux/macOS/FreeBSD, null (inert) on OpenBSD/Windows.
+pub const MemInfo = impl.MemInfo;
+pub const readPsiSomeAvg10 = impl.readPsiSomeAvg10;
+pub const readMemInfo = impl.readMemInfo;
+
 // Terminal
 pub fn getTerminalSize(fd: posix.fd_t) ?struct { rows: u16, cols: u16 } {
     var ws: posix.winsize = undefined;

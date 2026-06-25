@@ -163,7 +163,7 @@ fn renderTree(c: *Conductor, w: Writer, s: Style, now: i64) !void {
         if (entry.value_ptr.items.len == 0) continue;
         if (entry.value_ptr.items[0].sandboxed) continue;
         if (printed_any) try w.writeByte('\n');
-        try renderProject(c, w, s, entry.value_ptr.items, now, have_sandboxed);
+        try renderProject(c, w, s, entry.value_ptr.items, entry.key_ptr.*, now, have_sandboxed);
         printed_any = true;
     }
     // Sandboxed group: workers listed directly, no project sub-grouping.
@@ -177,7 +177,7 @@ fn renderTree(c: *Conductor, w: Writer, s: Style, now: i64) !void {
             for (entry.value_ptr.items) |wk| {
                 if (!wk.sandboxed) continue;
                 seen += 1;
-                try renderWorker(c, w, s, wk, now, false, seen == total);
+                try renderWorker(c, w, s, wk, entry.key_ptr.*, now, false, seen == total);
                 printed_any = true;
             }
         }
@@ -186,7 +186,7 @@ fn renderTree(c: *Conductor, w: Writer, s: Style, now: i64) !void {
     if (c.reserve) |r| {
         try w.writeByte('\n');
         try writeGroupHeader(w, s, "◇ reserve");
-        try renderWorker(c, w, s, r, now, false, true);
+        try renderWorker(c, w, s, r, null, now, false, true);
         printed_any = true;
     }
     if (!printed_any) {
@@ -206,7 +206,7 @@ fn writeGroupHeader(w: Writer, s: Style, label: []const u8) !void {
 // has multiple workers (with one worker its line already shows the figure).
 // When the whole project is inactive the header is dimmed too. Without styling,
 // the full path is printed plainly.
-fn renderProject(c: *Conductor, w: Writer, s: Style, workers: []const *Worker, now: i64, nested: bool) !void {
+fn renderProject(c: *Conductor, w: Writer, s: Style, workers: []const *Worker, key: []const u8, now: i64, nested: bool) !void {
     const all_inactive = for (workers) |wk| {
         if (wk.active_clients > 0) break false;
     } else true;
@@ -245,7 +245,7 @@ fn renderProject(c: *Conductor, w: Writer, s: Style, workers: []const *Worker, n
     }
     try w.writeByte('\n');
     for (workers, 0..) |wk, i| {
-        try renderWorker(c, w, s, wk, now, nested, i == workers.len - 1);
+        try renderWorker(c, w, s, wk, key, now, nested, i == workers.len - 1);
     }
 }
 
@@ -256,7 +256,7 @@ fn renderProject(c: *Conductor, w: Writer, s: Style, workers: []const *Worker, n
 // columns (uptime, RSS, CPU) line up regardless of label/version/mode length.
 const id_column_width = 26;
 
-fn renderWorker(c: *Conductor, w: Writer, s: Style, wk: *const Worker, now: i64, nested: bool, is_last: bool) !void {
+fn renderWorker(c: *Conductor, w: Writer, s: Style, wk: *const Worker, key: ?[]const u8, now: i64, nested: bool, is_last: bool) !void {
     const health = workerHealth(c, wk, now);
     const dim_line = health == .inactive;
     const pad = if (nested) indent ++ indent else indent;
@@ -320,7 +320,7 @@ fn renderWorker(c: *Conductor, w: Writer, s: Style, wk: *const Worker, now: i64,
         if (!dim_line) try s.close(w);
     }
     // State slot for inactive workers / reserve: idle + cull countdown.
-    if (health == .inactive) try writeIdleState(c, w, s, wk, now);
+    if (health == .inactive) try writeIdleState(c, w, s, wk, key, now);
     if (dim_line) try s.close(w);
     try w.writeByte('\n');
     if (health != .inactive) try renderClients(c, w, s, wk, now, nested, is_last);
@@ -329,7 +329,7 @@ fn renderWorker(c: *Conductor, w: Writer, s: Style, wk: *const Worker, now: i64,
 // "  idle 41m · culls in 1h19m". Called within the worker line's open dim span,
 // so base text inherits dim; only an imminent cull breaks out to amber/red and
 // then restores dim for the rest of the span. The reserve reads "ready"/"warming".
-fn writeIdleState(c: *Conductor, w: Writer, s: Style, wk: *const Worker, now: i64) !void {
+fn writeIdleState(c: *Conductor, w: Writer, s: Style, wk: *const Worker, key: ?[]const u8, now: i64) !void {
     const is_reserve = c.reserve == wk;
     try w.writeAll("   ");
     if (is_reserve) {
@@ -338,8 +338,8 @@ fn writeIdleState(c: *Conductor, w: Writer, s: Style, wk: *const Worker, now: i6
         try w.writeAll("idle ");
         try writeDuration(w, now - wk.last_active);
     }
-    if (c.cfg.worker_ttl > 0) {
-        const remaining = @as(i64, @intCast(c.cfg.worker_ttl)) - (now - wk.last_active);
+    if (c.cfg.max_ttl > 0) {
+        const remaining = @as(i64, @intCast(c.cfg.max_ttl)) - (now - wk.last_active);
         try w.writeAll(" · culls in ");
         if (remaining <= 60) {
             try s.open(w, ansi.reset ++ ansi.bold ++ ansi.red);
@@ -352,6 +352,10 @@ fn writeIdleState(c: *Conductor, w: Writer, s: Style, wk: *const Worker, now: i6
         } else {
             try writeDuration(w, remaining);
         }
+    }
+    // Eviction warmth, only meaningful (and shown) when pressure eviction is active.
+    if (c.pressure_monitor.active()) {
+        try w.print(" · warmth {d:.2}", .{c.workerActivity(wk, key, now)});
     }
 }
 
@@ -487,25 +491,26 @@ fn renderJson(c: *Conductor, w: Writer, now: i64) !void {
             first = false;
             worker_count += 1;
             total_clients += wk.active_clients;
-            total_rss += try writeWorkerJson(c, w, wk, now);
+            total_rss += try writeWorkerJson(c, w, wk, entry.key_ptr.*, now);
         }
     }
     try w.writeAll("],\"reserve\":");
     if (c.reserve) |r| {
-        total_rss += try writeWorkerJson(c, w, r, now);
+        total_rss += try writeWorkerJson(c, w, r, null, now);
     } else {
         try w.writeAll("null");
     }
     try w.print(",\"totals\":{{\"workers\":{d},\"reserve\":{d},\"clients\":{d},\"rss_bytes\":{d}}}", .{
         worker_count, @as(u8, if (c.reserve != null) 1 else 0), total_clients, total_rss,
     });
-    try w.print(",\"worker_ttl\":{d},\"label_ttl\":{d},\"worker_args\":", .{ c.cfg.worker_ttl, c.cfg.label_ttl });
+    try w.print(",\"max_ttl\":{d},\"min_ttl\":{d},\"label_ttl\":{d},\"worker_args\":", .{ c.cfg.max_ttl, c.cfg.min_ttl, c.cfg.label_ttl });
     try writeJsonString(w, c.cfg.worker_args);
+    try w.print(",\"pressure\":{{\"source\":\"{s}\",\"under_pressure\":{}}}", .{ @tagName(c.pressure_monitor.source), c.pressure_monitor.under_pressure });
     try w.writeByte('}');
 }
 
 // Emit one worker object; returns its RSS so the caller can total it.
-fn writeWorkerJson(c: *Conductor, w: Writer, wk: *const Worker, now: i64) !u64 {
+fn writeWorkerJson(c: *Conductor, w: Writer, wk: *const Worker, key: ?[]const u8, now: i64) !u64 {
     const pid = platform.getChildPid(wk.process);
     const stats = platform.getProcessStats(pid);
     const rss = if (stats) |st| st.rss_bytes else 0;
@@ -522,6 +527,7 @@ fn writeWorkerJson(c: *Conductor, w: Writer, wk: *const Worker, now: i64) !u64 {
     try w.print(",\"interactive\":{},\"sandboxed\":{}", .{ wk.interactive, wk.sandboxed });
     try w.print(",\"created_at\":{d},\"last_active\":{d},\"last_pinged\":{d}", .{ wk.created_at, wk.last_active, wk.last_pinged });
     try w.print(",\"ping_pending\":{},\"active_clients\":{d}", .{ wk.ping_pending, wk.active_clients });
+    try w.print(",\"warmth\":{d:.4}", .{c.workerActivity(wk, key, now)});
     if (stats) |st| {
         try w.print(",\"rss_bytes\":{d},\"cpu_seconds\":{d:.3}", .{ st.rss_bytes, st.cpu_seconds });
     } else {
