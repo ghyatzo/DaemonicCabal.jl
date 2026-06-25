@@ -8,6 +8,7 @@ const STATE = (
     client_tasks = Dict{Int, Task}(),
     project = Ref(""),
     lastclient = Ref(time()),
+    last_contact = Ref(time()),
     lock = SpinLock(),
     soft_exit = Ref(false),
     conductor_conn = Ref{Union{IO, Nothing}}(nothing),
@@ -19,8 +20,8 @@ const STATE = (
 # Configuration (set during runworker from environment)
 RUNTIME_DIR::String = ""
 MAX_CLIENTS::Int = 1
-WORKER_TTL::Int = 0
 PORT_BASE::Int = 0  # Base port for managed port range (from JULIA_DAEMON_PORTS)
+ORPHAN_FAILSAFE::Int = 0  # seconds of conductor silence before self-exit (0 = off)
 
 # Exiting
 
@@ -41,18 +42,29 @@ function try_load_revise()
     end
 end
 
-# TTL checking
+# Orphan failsafe: exit if the conductor has gone silent too long. Not an idle
+# policy (the conductor owns that) — only fires when the conductor truly died
+# without pdeathsig catching it (non-Linux, or an unclean crash). `last_contact`
+# is refreshed on every conductor message (see runworker).
 
-function queue_ttl_check()
-    if WORKER_TTL > 0
-        Timer(perform_ttl_check, WORKER_TTL)
+function queue_orphan_check()
+    ORPHAN_FAILSAFE > 0 || return
+    Timer(perform_orphan_check, ORPHAN_FAILSAFE; interval = ORPHAN_FAILSAFE)
+end
+
+function perform_orphan_check(::Timer)
+    ORPHAN_FAILSAFE > 0 || return
+    if time() - (@lock STATE.lock STATE.last_contact[]) >= ORPHAN_FAILSAFE
+        real_exit(0)
     end
 end
 
-function perform_ttl_check(::Timer)
-    if WORKER_TTL > 0 && time() - (@lock STATE.lock STATE.lastclient[]) >= WORKER_TTL
-        send_notification(STATE.conductor_socket[], NOTIF_TYPE.worker_exit, UInt32(getpid()))
-        real_exit(0)
+# On Linux, ask the kernel to SIGKILL us the moment our parent (the conductor)
+# dies — the airtight orphan guard the coarse failsafe backstops elsewhere.
+function set_parent_death_signal()
+    @static if Sys.islinux()
+        PR_SET_PDEATHSIG = Cint(1)
+        @ccall prctl(PR_SET_PDEATHSIG::Cint, Base.SIGKILL::Culong, 0::Culong, 0::Culong, 0::Culong)::Cint
     end
 end
 
@@ -387,7 +399,6 @@ function unregister_client!(client::ClientInfo)
                       UInt32(client.pid))
     ensure_standby_sockets()
     ensure_standby_module()
-    queue_ttl_check()
 end
 
 function spawn_client!(conn::IO, client::ClientInfo)
@@ -440,10 +451,14 @@ function runworker(socketpath::String, worker_number::Int=-1, conductor_address:
     end
     global RUNTIME_DIR = if is_tcp_address(STATE.conductor_socket[]) "" else dirname(socketpath) end
     global MAX_CLIENTS = parse(Int, get(ENV, "JULIA_DAEMON_WORKER_MAXCLIENTS", "1"))
-    global WORKER_TTL = parse(Int, get(ENV, "JULIA_DAEMON_WORKER_TTL", "0"))
+    max_ttl = parse(Int, get(ENV, "JULIA_DAEMON_MAX_TTL",
+                             get(ENV, "JULIA_DAEMON_WORKER_TTL", "7200")))
+    global ORPHAN_FAILSAFE = max_ttl > 0 ? max_ttl * 4 : 0
     global PORT_BASE = if haskey(ENV, "JULIA_DAEMON_PORTS")
         parse(Int, split(ENV["JULIA_DAEMON_PORTS"], '-')[1])
     else 0 end
+    set_parent_death_signal()
+    queue_orphan_check()
     ensure_standby_sockets()
     ensure_standby_module()
     errormonitor(Threads.@spawn warm_repl_path())
@@ -451,6 +466,7 @@ function runworker(socketpath::String, worker_number::Int=-1, conductor_address:
         verify_magic(conn)
         while isopen(conn)
             header = read_header(conn)
+            @lock STATE.lock STATE.last_contact[] = time()
             if header.msg_type == MSG_TYPE.ping
                 active = @lock STATE.lock length(STATE.clients)
                 send_pong(conn, active)

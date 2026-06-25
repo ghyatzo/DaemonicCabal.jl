@@ -38,8 +38,10 @@ const EV_ERROR: u16 = if (@hasDecl(c.EV, "ERROR")) c.EV.ERROR else 0x4000;
 const UDATA_ACCEPT: usize = 0;
 const UDATA_SIGNAL: usize = 1;
 const UDATA_PING_TIMER: usize = 2;
-// Unique ident for the periodic ping timer (won't collide with file descriptors)
+const UDATA_PRESSURE_TIMER: usize = 4;
+// Unique idents for periodic timers (won't collide with file descriptors)
 const TIMER_IDENT_PING: usize = 0xFFFF_0001;
+const TIMER_IDENT_PRESSURE: usize = 0xFFFF_0002;
 
 // EventLoop (wraps kqueue fd + configuration)
 pub const EventLoop = struct {
@@ -76,8 +78,12 @@ pub const EventLoop = struct {
         _ = keventSubmit(self.kq, &changes);
     }
 
-    /// Cancel pending async ping read and drain the pong response.
+    /// Delete kqueue registrations referencing `w`: the health-check timer
+    /// (`ptr|1`, armable without a ping in flight) and, when a ping is pending,
+    /// the read + pong-timeout timer (`ptr`). isLiveWorker guards any stale event.
     pub fn cancelPendingPing(self: *EventLoop, w: *worker.Worker) void {
+        var hc = [1]c.Kevent{makeKevent(@intFromPtr(w) | 1, c.EVFILT.TIMER, c.EV.DELETE, 0, 0, 0)};
+        _ = keventSubmit(self.kq, &hc);
         if (!w.ping_pending) return;
         // Delete the read registration (may already be gone if it fired)
         var changes = [2]c.Kevent{
@@ -121,6 +127,13 @@ pub fn run(conductor: *Conductor, server: *Io.net.Server) void {
         std.debug.print("Fatal: failed to register initial kevents\n", .{});
         return;
     }
+    const pressure_active = conductor.pressure_monitor.active();
+    if (pressure_active) {
+        const interval_s: u64 = @min(@as(u64, 5), conductor.cfg.ping_interval);
+        const interval_ms: isize = @intCast(interval_s * 1000);
+        var pc = [1]c.Kevent{makeKevent(TIMER_IDENT_PRESSURE, c.EVFILT.TIMER, c.EV.ADD, 0, interval_ms, UDATA_PRESSURE_TIMER)};
+        _ = keventSubmit(kq, &pc);
+    }
     // Event buffer
     var events: [32]c.Kevent = undefined;
     // Empty changelist for calls where we only want to wait for events
@@ -151,13 +164,20 @@ pub fn run(conductor: *Conductor, server: *Io.net.Server) void {
                     if (handleSignal(conductor, server, &server_fd, kq, &signal_buf)) return;
                 },
                 UDATA_PING_TIMER => {
+                    if (!pressure_active) conductor.sweepPendingKills();
+                    conductor.enforceMaxTtl();
                     queueWorkerPings(conductor, kq);
                 },
+                UDATA_PRESSURE_TIMER => {
+                    conductor.sweepPendingKills();
+                    conductor.runEvictionEpisode();
+                },
                 else => {
-                    // Worker event: udata is (worker_ptr | tag)
-                    // Bit 0: 0 = pong read/timeout, 1 = health check timeout
+                    // Worker event: udata is (worker_ptr | tag); bit 0: 0 = pong
+                    // read/timeout, 1 = health check timeout.
                     const is_health_check = (udata & 1) != 0;
                     const w: *worker.Worker = @ptrFromInt(udata & ~@as(usize, 1));
+                    if (!conductor.isLiveWorker(w)) continue; // stale event for a retired worker
                     if (ev.filter == c.EVFILT.TIMER) {
                         if (is_health_check) {
                             handleHealthCheck(conductor, kq, w);

@@ -48,10 +48,120 @@ pub fn rawWaitpid(pid: posix.pid_t) posix.pid_t {
     var status: c_int = 0;
     return c.waitpid(pid, &status, 1); // WNOHANG = 1
 }
-// Per-process memory/CPU stats not yet implemented on BSD/macOS (no /proc).
-// A sysctl(KERN_PROC) implementation could provide these without libc later.
-pub fn getProcessStats(_: posix.pid_t) ?shared.ProcessStats {
+// Read a single unsigned integer named sysctl (e.g. "vm.stats.vm.v_free_count").
+// Width varies by sysctl, so read into the widest and zero-extend.
+fn sysctlUint(comptime name: [:0]const u8) ?u64 {
+    var val: u64 = 0;
+    var len: usize = @sizeOf(u64);
+    if (c.sysctlbyname(name, &val, &len, null, 0) != 0) return null;
+    return switch (len) {
+        8 => val,
+        4 => @as(u32, @truncate(val)),
+        else => null,
+    };
+}
+
+// macOS only (mach task_vm_info). FreeBSD/OpenBSD return null — their kinfo_proc
+// ABI struct can't be validated without a real host — so eviction ranks by
+// activity alone there.
+pub fn getProcessStats(pid: posix.pid_t) ?shared.ProcessStats {
+    if (builtin.os.tag != .macos) return null;
+    const vm = darwinTaskVmInfo(pid) orelse return null;
+    return .{ .rss_bytes = vm.resident_size, .cpu_seconds = 0 };
+}
+
+// Reclaimable footprint. On macOS, phys_footprint is the per-task private memory
+// (excludes clean shared sysimage text) — closer to USS than RSS. Elsewhere null
+// (eviction falls back to RSS, here also null).
+pub fn processReclaimable(pid: posix.pid_t) ?u64 {
+    if (builtin.os.tag != .macos) return null;
+    const vm = darwinTaskVmInfo(pid) orelse return null;
+    return vm.phys_footprint;
+}
+
+// task_for_pid usually succeeds for the conductor's own children, but may be
+// denied (sandbox/entitlement) — null then, and callers degrade gracefully.
+fn darwinTaskVmInfo(pid: posix.pid_t) ?c.task_vm_info_data_t {
+    if (builtin.os.tag != .macos) return null;
+    var port: c.mach_port_name_t = undefined;
+    if (c.task_for_pid(c.mach_task_self(), pid, &port) != 0) return null;
+    var info: c.task_vm_info_data_t = undefined;
+    var count: c.mach_msg_type_number_t = c.TASK.VM.INFO_COUNT;
+    const rc = c.task_info(port, c.TASK.VM.INFO, @ptrCast(&info), &count);
+    if (rc != 0) return null;
+    return info;
+}
+
+pub const MemInfo = struct { available: u64, total: u64 };
+
+// No PSI equivalent on BSD/macOS; the level path (readMemInfo) is used instead.
+pub fn readPsiSomeAvg10() ?f64 {
     return null;
+}
+
+// Free-memory level: available = reclaimable-without-paging pages × page size,
+// total = physical RAM. Per-OS; null if unreadable (feature stays TTL-only).
+pub fn readMemInfo() ?MemInfo {
+    return switch (builtin.os.tag) {
+        .macos => darwinMemInfo(),
+        .freebsd => blk: {
+            const page = shared_page_size();
+            const free = sysctlUint("vm.stats.vm.v_free_count") orelse break :blk null;
+            const inactive = sysctlUint("vm.stats.vm.v_inactive_count") orelse 0;
+            const cache = sysctlUint("vm.stats.vm.v_cache_count") orelse 0;
+            const total = sysctlUint("hw.physmem") orelse break :blk null;
+            break :blk MemInfo{ .available = (free + inactive + cache) * page, .total = total };
+        },
+        else => null, // OpenBSD/NetBSD: uvmexp not name-addressable
+    };
+}
+
+const shared_page_size = std.heap.pageSize;
+
+// macOS available memory via host_statistics64(HOST_VM_INFO64). free_count alone
+// understates badly (macOS keeps little truly free), so include inactive,
+// purgeable and external — pages reclaimable without paging out anonymous memory.
+const HOST_VM_INFO64: c_int = 4;
+// vm_statistics64_data_t from <mach/vm_statistics.h>; @sizeOf/4 must equal the
+// kernel's HOST_VM_INFO64_COUNT (38), so every field width below is load-bearing.
+const vm_statistics64 = extern struct {
+    free_count: u32,
+    active_count: u32,
+    inactive_count: u32,
+    wire_count: u32,
+    zero_fill_count: u64,
+    reactivations: u64,
+    pageins: u64,
+    pageouts: u64,
+    faults: u64,
+    cow_faults: u64,
+    lookups: u64,
+    hits: u64,
+    purges: u64,
+    purgeable_count: u32,
+    speculative_count: u32,
+    decompressions: u64,
+    compressions: u64,
+    swapins: u64,
+    swapouts: u64,
+    compressor_page_count: u32,
+    throttled_count: u32,
+    external_page_count: u32,
+    internal_page_count: u32,
+    total_uncompressed_pages_in_compressor: u64,
+};
+
+extern "c" fn host_statistics64(host: c.mach_port_t, flavor: c_int, info: *anyopaque, count: *c.mach_msg_type_number_t) c.kern_return_t;
+
+fn darwinMemInfo() ?MemInfo {
+    if (builtin.os.tag != .macos) return null;
+    var vm: vm_statistics64 = undefined;
+    var count: c.mach_msg_type_number_t = @sizeOf(vm_statistics64) / @sizeOf(u32);
+    if (host_statistics64(c.mach_host_self(), HOST_VM_INFO64, @ptrCast(&vm), &count) != 0) return null;
+    const total = sysctlUint("hw.memsize") orelse return null;
+    const page = shared_page_size();
+    const reclaimable = @as(u64, vm.free_count) + vm.inactive_count + vm.purgeable_count + vm.external_page_count;
+    return .{ .available = reclaimable * page, .total = total };
 }
 pub fn getParentName(_: posix.pid_t, _: []u8) ?[]const u8 {
     return null;

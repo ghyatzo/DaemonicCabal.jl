@@ -44,14 +44,21 @@ pub const EventLoop = struct {
         _ = self.ring.timeout(@intFromPtr(w) | 1, &self.health_check_ts, 0, 0) catch {};
     }
 
-    /// Cancel pending async ping read and drain the pong response.
+    /// Cancel in-flight ops referencing `w`: the health-check timeout (`ptr|1`,
+    /// armable without a ping in flight) and the pending ping read (`ptr`).
+    /// Draining the cancels isn't relied upon — isLiveWorker rejects any stale
+    /// completion that still arrives.
     pub fn cancelPendingPing(self: *EventLoop, w: *worker.Worker) void {
-        if (!w.ping_pending) return;
-        _ = self.ring.cancel(@intFromEnum(EventLocation.ignored), @intFromPtr(w), 0) catch {};
-        _ = self.ring.submit() catch {};
-        var buf: [5]u8 = undefined;
-        protocol.readExact(w.socket, &buf) catch {};
-        w.ping_pending = false;
+        _ = self.ring.cancel(@intFromEnum(EventLocation.ignored), @intFromPtr(w) | 1, 0) catch {};
+        if (w.ping_pending) {
+            _ = self.ring.cancel(@intFromEnum(EventLocation.ignored), @intFromPtr(w), 0) catch {};
+            _ = self.ring.submit() catch {};
+            var buf: [5]u8 = undefined;
+            protocol.readExact(w.socket, &buf) catch {};
+            w.ping_pending = false;
+        } else {
+            _ = self.ring.submit() catch {};
+        }
     }
 };
 
@@ -64,6 +71,8 @@ pub fn run(conductor: *Conductor, server: *Io.net.Server) void {
     var server_fd = server.socket.handle;
     var ping_timer = linux.kernel_timespec{ .sec = @intCast(conductor.cfg.ping_interval), .nsec = 0 };
     var ping_timeout_ts = linux.kernel_timespec{ .sec = @intCast(conductor.cfg.ping_timeout), .nsec = 0 };
+    const pressure_active = conductor.pressure_monitor.active();
+    var pressure_timer = linux.kernel_timespec{ .sec = @intCast(@min(@as(u64, 5), conductor.cfg.ping_interval)), .nsec = 0 };
     // Queue initial operations
     _ = ring.accept(@intFromEnum(EventLocation.accept), server_fd, &client_addr, &client_addr_len, 0) catch |err| {
         std.debug.print("Fatal: failed to queue initial accept: {}\n", .{err});
@@ -77,6 +86,12 @@ pub fn run(conductor: *Conductor, server: *Io.net.Server) void {
         std.debug.print("Fatal: failed to queue ping timer: {}\n", .{err});
         return;
     };
+    if (pressure_active) {
+        _ = ring.timeout(@intFromEnum(EventLocation.pressure_timer), &pressure_timer, 0, 0) catch |err| {
+            std.debug.print("Fatal: failed to queue pressure timer: {}\n", .{err});
+            return;
+        };
+    }
     while (true) {
         _ = ring.submit_and_wait(1) catch |err| {
             if (err == error.SignalInterrupt) continue;
@@ -85,6 +100,7 @@ pub fn run(conductor: *Conductor, server: *Io.net.Server) void {
         };
         var need_rearm_accept = false;
         var need_rearm_ping_timer = false;
+        var need_rearm_pressure_timer = false;
         while (ring.cq_ready() > 0) {
             const cqe = ring.copy_cqe() catch |err| {
                 std.debug.print("Fatal: io_uring copy_cqe failed: {}\n", .{err});
@@ -94,6 +110,7 @@ pub fn run(conductor: *Conductor, server: *Io.net.Server) void {
             // Worker events (user_data >= 0x1000, bit 0: 0=pong, 1=health check timeout)
             if (user_data >= 0x1000) {
                 const w: *worker.Worker = @ptrFromInt(user_data & ~@as(u64, 1));
+                if (!conductor.isLiveWorker(w)) continue; // stale completion for a retired worker
                 if ((user_data & 1) != 0) {
                     const recently_pinged = (conductor.currentTime() - w.last_pinged) < 2;
                     if (w.active_clients == 0 and !w.ping_pending and !recently_pinged) {
@@ -153,8 +170,15 @@ pub fn run(conductor: *Conductor, server: *Io.net.Server) void {
                     };
                 },
                 .ping_timer => {
+                    if (!pressure_active) conductor.sweepPendingKills();
+                    conductor.enforceMaxTtl();
                     queueWorkerPings(conductor, ring, &ping_timeout_ts);
                     need_rearm_ping_timer = true;
+                },
+                .pressure_timer => {
+                    conductor.sweepPendingKills();
+                    conductor.runEvictionEpisode();
+                    need_rearm_pressure_timer = true;
                 },
                 .ignored, _ => {},
             }
@@ -169,6 +193,12 @@ pub fn run(conductor: *Conductor, server: *Io.net.Server) void {
         if (need_rearm_ping_timer) {
             _ = ring.timeout(@intFromEnum(EventLocation.ping_timer), &ping_timer, 0, 0) catch |err| {
                 std.debug.print("Fatal: failed to requeue ping timer: {}\n", .{err});
+                return;
+            };
+        }
+        if (need_rearm_pressure_timer) {
+            _ = ring.timeout(@intFromEnum(EventLocation.pressure_timer), &pressure_timer, 0, 0) catch |err| {
+                std.debug.print("Fatal: failed to requeue pressure timer: {}\n", .{err});
                 return;
             };
         }
