@@ -69,6 +69,10 @@ pub const Occupancy = struct {
 
     pub fn attach(self: *Occupancy, now: i64, half_life_s: u64) void {
         self.fold(now, half_life_s);
+        // A fresh worker (never occupied) starts mid-scale, so its displayed
+        // activity climbs from 0.5 while busy instead of being masked near 0 by
+        // the decaying crf term.
+        if (self.value == 0) self.value = 0.5;
         self.busy = true;
     }
 
@@ -77,11 +81,11 @@ pub const Occupancy = struct {
         self.busy = false;
     }
 
-    /// Valid only when idle — assumes idleness since last_update, so a held
-    /// worker (hard-exempt from eviction) must never reach here.
+    /// Current occupancy in [0,1], projecting the interval since last_update
+    /// forward — rising toward 1 while busy, decaying toward 0 while idle.
     pub fn read(self: *const Occupancy, now: i64, half_life_s: u64) f64 {
-        std.debug.assert(!self.busy);
-        return self.value * decay(now - self.last_update, half_life_s);
+        const d = decay(now - self.last_update, half_life_s);
+        return (if (self.busy) 1 - d else 0) + self.value * d;
     }
 };
 

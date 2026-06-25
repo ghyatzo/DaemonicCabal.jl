@@ -11,6 +11,7 @@ const platform = @import("platform/main.zig");
 const config = @import("config.zig");
 const worker = @import("worker.zig");
 const argspec = @import("args.zig");
+const pal = @import("palette.zig");
 
 const Conductor = main.Conductor;
 const Worker = worker.Worker;
@@ -35,24 +36,42 @@ const Writer = struct {
     }
 };
 
-/// Render the full status report. `format` is the `--status=<value>` argument
-/// ("json" selects machine output; anything else is the styled tree). `tty`
-/// enables ANSI styling. Caller owns the returned slice.
-pub fn render(c: *Conductor, format: ?[]const u8, tty: bool) ![]u8 {
-    return renderAt(c, format, tty, c.currentTime());
+/// How to render a report. `format` is the `--status=<value>` argument ("json"
+/// → machine output, else the styled tree); `tty` enables ANSI styling;
+/// `palette`, when the client answered the colour probe, drives truecolor
+/// gradients (else flat 8-color).
+pub const Options = struct {
+    format: ?[]const u8 = null,
+    tty: bool = false,
+    palette: ?*const pal.Palette = null,
+};
+
+/// A rendered report. `bytes` is caller-owned; `lines` counts newlines, for the
+/// live view's cursor-up redraw.
+pub const Report = struct {
+    bytes: []u8,
+    lines: usize,
+};
+
+/// Render the report at the current time. Caller owns `Report.bytes`.
+pub fn render(c: *Conductor, opts: Options) !Report {
+    return renderAt(c, opts, c.currentTime());
 }
 
-// Render against an explicit reference time. Exposed for the standalone test
-// harness, which builds a Conductor with no live `Io` clock.
-pub fn renderAt(c: *Conductor, format: ?[]const u8, tty: bool, now: i64) ![]u8 {
+// Render against an explicit reference time; the standalone test harness has no
+// live `Io` clock.
+pub fn renderAt(c: *Conductor, opts: Options, now: i64) !Report {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(c.allocator);
     const w = Writer{ .list = &buf, .gpa = c.allocator };
-    if (format != null and std.mem.eql(u8, format.?, "json"))
-        try renderJson(c, w, now)
-    else
-        try renderTree(c, w, Style{ .enabled = tty }, now);
-    return buf.toOwnedSlice(c.allocator);
+    if (opts.format != null and std.mem.eql(u8, opts.format.?, "json")) {
+        try renderJson(c, w, now);
+    } else {
+        const tints: ?Tints = if (opts.palette) |p| .{ .palette = p } else null;
+        try renderTree(c, w, Style{ .enabled = opts.tty }, tints, now);
+    }
+    const lines = std.mem.count(u8, buf.items, "\n");
+    return .{ .bytes = try buf.toOwnedSlice(c.allocator), .lines = lines };
 }
 
 // --- Styling -----------------------------------------------------------------
@@ -86,6 +105,78 @@ const Style = struct {
         try self.close(w);
     }
 };
+
+// --- Gradients ----------------------------------------------------------------
+
+// Each stat ramps between two anchor colours as its value moves 0→1. An anchor
+// is a palette role — an ANSI slot (resolved from the probed terminal palette,
+// so it tracks the user's theme, with a muted fallback) or the default
+// foreground. Stat → (t=0 anchor → t=1 anchor):
+//   rss      green → red       (t = rss / rssCeiling)
+//   cpu      blue  → magenta   (t = cpu% / 100)
+//   cull     fg    → yellow    (t = 1 − remaining/max_ttl; near expiry → yellow)
+//   activity fg   → cyan       (t = activity value in [0,1])
+const Tint = enum { rss, cpu, cull, activity };
+
+// A gradient anchor: the default foreground, or an ANSI slot with the muted
+// fallback used when the terminal didn't report it.
+const Anchor = union(enum) {
+    fg,
+    slot: struct { idx: usize, fallback: pal.Rgb },
+};
+const FALLBACK_FG = pal.Rgb.init(0xcc, 0xcc, 0xcc);
+fn anslot(idx: usize, fb: pal.Rgb) Anchor {
+    return .{ .slot = .{ .idx = idx, .fallback = fb } };
+}
+const red = anslot(1, pal.Rgb.init(0xc8, 0x3c, 0x3c));
+const green = anslot(2, pal.Rgb.init(0x3c, 0xc8, 0x50));
+const yellow = anslot(3, pal.Rgb.init(0xc8, 0xa0, 0x3c));
+const blue = anslot(4, pal.Rgb.init(0x50, 0x78, 0xd0));
+const magenta = anslot(5, pal.Rgb.init(0xc0, 0x50, 0xc0));
+const cyan = anslot(6, pal.Rgb.init(0x40, 0xb0, 0xb8));
+// The (t=0, t=1) anchor pair for each stat, indexed by Tint.
+const anchors = std.enums.directEnumArray(Tint, [2]Anchor, 0, .{
+    .rss = .{ green, red },
+    .cpu = .{ blue, magenta },
+    .cull = .{ .fg, yellow },
+    .activity = .{ .fg, cyan },
+});
+
+// The probed palette for one render, used to resolve gradient anchors. Present
+// only when the client is a truecolor TTY that answered the colour probe;
+// otherwise null and stats fall back to the flat 8-color styling.
+const Tints = struct {
+    palette: *const pal.Palette,
+
+    fn resolve(self: Tints, anchor: Anchor) pal.Rgb {
+        return switch (anchor) {
+            .fg => self.palette.foreground orelse FALLBACK_FG,
+            .slot => |a| pal.slot(self.palette, a.idx, a.fallback),
+        };
+    }
+
+    // Open the truecolor fg SGR for `tint` at fraction `t`. Caller resets.
+    fn open(self: Tints, w: Writer, tint: Tint, t: f64) !void {
+        const a = anchors[@intFromEnum(tint)];
+        var buf: [pal.sgr_fg_len]u8 = undefined;
+        try w.writeAll(pal.sgrFg(pal.blend(self.resolve(a[0]), self.resolve(a[1]), t), &buf));
+    }
+};
+
+// Per-render invariants threaded through the tree alongside (c, s, now): the
+// resolved gradient anchors (null without a truecolor probe) and the RSS the
+// gradient treats as fully "hot" — see rssCeiling.
+const Ctx = struct {
+    tints: ?Tints,
+    rss_ceiling: u64,
+};
+
+// The gradient anchors to use, present only when styling is on AND the terminal
+// answered the colour probe. Sites that would otherwise emit a flat ANSI colour
+// branch on this to decide between a truecolor ramp and their plain fallback.
+fn gradientTints(s: Style, ctx: Ctx) ?Tints {
+    return if (s.enabled) ctx.tints else null;
+}
 
 // --- Health ------------------------------------------------------------------
 
@@ -126,20 +217,34 @@ fn writeBytes(w: Writer, bytes: u64) !void {
 
 // Compact duration: "8s", "41m", "2h14m", "3d2h".
 fn writeDuration(w: Writer, total_seconds: i64) !void {
+    var buf: [16]u8 = undefined;
+    try w.writeAll(formatDuration(&buf, total_seconds));
+}
+
+// `writeDuration` left-padded to a fixed width (e.g. the uptime column), so the
+// stats after it align. Over-width values print unpadded.
+fn writeDurationPadded(w: Writer, total_seconds: i64, width: usize) !void {
+    var buf: [16]u8 = undefined;
+    const d = formatDuration(&buf, total_seconds);
+    if (d.len < width) try w.writeByteNTimes(' ', width - d.len);
+    try w.writeAll(d);
+}
+
+fn formatDuration(buf: *[16]u8, total_seconds: i64) []const u8 {
     const s: u64 = @intCast(@max(0, total_seconds));
-    if (s < 60) {
-        try w.print("{d}s", .{s});
-    } else if (s < 3600) {
-        try w.print("{d}m", .{s / 60});
-    } else if (s < 86400) {
+    return if (s < 60)
+        std.fmt.bufPrint(buf, "{d}s", .{s}) catch unreachable
+    else if (s < 3600)
+        std.fmt.bufPrint(buf, "{d}m", .{s / 60}) catch unreachable
+    else if (s < 86400) blk: {
         const h = s / 3600;
         const m = (s % 3600) / 60;
-        if (m == 0) try w.print("{d}h", .{h}) else try w.print("{d}h{d}m", .{ h, m });
-    } else {
+        break :blk if (m == 0) std.fmt.bufPrint(buf, "{d}h", .{h}) catch unreachable else std.fmt.bufPrint(buf, "{d}h{d}m", .{ h, m }) catch unreachable;
+    } else blk: {
         const d = s / 86400;
         const h = (s % 86400) / 3600;
-        if (h == 0) try w.print("{d}d", .{d}) else try w.print("{d}d{d}h", .{ d, h });
-    }
+        break :blk if (h == 0) std.fmt.bufPrint(buf, "{d}d", .{d}) catch unreachable else std.fmt.bufPrint(buf, "{d}d{d}h", .{ d, h }) catch unreachable;
+    };
 }
 
 // Contract a leading home-directory prefix to "~".
@@ -152,7 +257,8 @@ fn contractHome(path: []const u8, home: []const u8) []const u8 {
 
 const indent = "  ";
 
-fn renderTree(c: *Conductor, w: Writer, s: Style, now: i64) !void {
+fn renderTree(c: *Conductor, w: Writer, s: Style, tints: ?Tints, now: i64) !void {
+    const ctx = Ctx{ .tints = tints, .rss_ceiling = rssCeiling(c) };
     const have_sandboxed = anySandboxed(c);
     var printed_any = false;
     // Host group: real projects with non-sandboxed workers. The "host" header
@@ -163,7 +269,7 @@ fn renderTree(c: *Conductor, w: Writer, s: Style, now: i64) !void {
         if (entry.value_ptr.items.len == 0) continue;
         if (entry.value_ptr.items[0].sandboxed) continue;
         if (printed_any) try w.writeByte('\n');
-        try renderProject(c, w, s, entry.value_ptr.items, entry.key_ptr.*, now, have_sandboxed);
+        try renderProject(c, w, s, ctx, entry.value_ptr.items, entry.key_ptr.*, now, have_sandboxed);
         printed_any = true;
     }
     // Sandboxed group: workers listed directly, no project sub-grouping.
@@ -177,7 +283,7 @@ fn renderTree(c: *Conductor, w: Writer, s: Style, now: i64) !void {
             for (entry.value_ptr.items) |wk| {
                 if (!wk.sandboxed) continue;
                 seen += 1;
-                try renderWorker(c, w, s, wk, entry.key_ptr.*, now, false, seen == total);
+                try renderWorker(c, w, s, ctx, wk, entry.key_ptr.*, now, false, seen == total);
                 printed_any = true;
             }
         }
@@ -186,7 +292,7 @@ fn renderTree(c: *Conductor, w: Writer, s: Style, now: i64) !void {
     if (c.reserve) |r| {
         try w.writeByte('\n');
         try writeGroupHeader(w, s, "◇ reserve");
-        try renderWorker(c, w, s, r, null, now, false, true);
+        try renderWorker(c, w, s, ctx, r, null, now, false, true);
         printed_any = true;
     }
     if (!printed_any) {
@@ -206,7 +312,7 @@ fn writeGroupHeader(w: Writer, s: Style, label: []const u8) !void {
 // has multiple workers (with one worker its line already shows the figure).
 // When the whole project is inactive the header is dimmed too. Without styling,
 // the full path is printed plainly.
-fn renderProject(c: *Conductor, w: Writer, s: Style, workers: []const *Worker, key: []const u8, now: i64, nested: bool) !void {
+fn renderProject(c: *Conductor, w: Writer, s: Style, ctx: Ctx, workers: []const *Worker, key: []const u8, now: i64, nested: bool) !void {
     const all_inactive = for (workers) |wk| {
         if (wk.active_clients > 0) break false;
     } else true;
@@ -215,6 +321,8 @@ fn renderProject(c: *Conductor, w: Writer, s: Style, workers: []const *Worker, k
     try w.writeAll(pad);
     if (path.len == 0) {
         // No project: a worker running in the default (global) environment.
+        try s.wrap(w, ansi.bold ++ ansi.blue, "@");
+        try w.writeByte(' ');
         try s.wrap(w, ansi.dim, "(default environment)");
     } else if (s.enabled) {
         const shown = contractHome(path, c.cfg.host_home);
@@ -245,7 +353,7 @@ fn renderProject(c: *Conductor, w: Writer, s: Style, workers: []const *Worker, k
     }
     try w.writeByte('\n');
     for (workers, 0..) |wk, i| {
-        try renderWorker(c, w, s, wk, key, now, nested, i == workers.len - 1);
+        try renderWorker(c, w, s, ctx, wk, key, now, nested, i == workers.len - 1);
     }
 }
 
@@ -256,7 +364,7 @@ fn renderProject(c: *Conductor, w: Writer, s: Style, workers: []const *Worker, k
 // columns (uptime, RSS, CPU) line up regardless of label/version/mode length.
 const id_column_width = 26;
 
-fn renderWorker(c: *Conductor, w: Writer, s: Style, wk: *const Worker, key: ?[]const u8, now: i64, nested: bool, is_last: bool) !void {
+fn renderWorker(c: *Conductor, w: Writer, s: Style, ctx: Ctx, wk: *const Worker, key: ?[]const u8, now: i64, nested: bool, is_last: bool) !void {
     const health = workerHealth(c, wk, now);
     const dim_line = health == .inactive;
     const pad = if (nested) indent ++ indent else indent;
@@ -308,30 +416,72 @@ fn renderWorker(c: *Conductor, w: Writer, s: Style, wk: *const Worker, key: ?[]c
     if (!dim_line) try s.open(w, ansi.dim);
     try w.writeAll(" up ");
     if (!dim_line) try s.close(w);
-    try writeDuration(w, now - wk.created_at);
+    try writeDurationPadded(w, now - wk.created_at, 5);
     const stats = platform.getProcessStats(platform.getChildPid(wk.process));
+    // RSS and CPU%: on an active worker with a probed palette, each renders in
+    // its gradient (RSS green→red vs the pool's hottest worker, CPU% blue→
+    // magenta vs 100%). Inactive workers stay in the line's uniform dim span;
+    // without a palette both fall back to plain/dim text as before.
     try w.writeAll("  ");
-    if (stats) |st| try writeBytes(w, st.rss_bytes) else try w.writeAll("n/a");
+    if (stats) |st| {
+        const t = if (ctx.rss_ceiling > 0)
+            @as(f64, @floatFromInt(st.rss_bytes)) / @as(f64, @floatFromInt(ctx.rss_ceiling))
+        else
+            0;
+        const styled = try openStat(w, s, ctx, dim_line, .rss, t);
+        try writeBytes(w, st.rss_bytes);
+        try closeStat(w, s, dim_line, styled);
+    } else try w.writeAll("n/a");
     if (stats) |st| {
         const uptime: f64 = @floatFromInt(@max(1, now - wk.created_at));
         const pct = st.cpu_seconds / uptime * 100;
-        if (!dim_line) try s.open(w, ansi.dim);
-        try w.print("  {d:.0}%", .{pct});
-        if (!dim_line) try s.close(w);
+        try w.writeAll("  ");
+        const styled = try openStat(w, s, ctx, dim_line, .cpu, pct / 100);
+        try w.print("{d:.0}%", .{pct});
+        try closeStat(w, s, dim_line, styled);
     }
+    // Activity (fg→cyan) sits right after CPU% on every worker — so the column
+    // aligns across active and idle lines — shown only under pressure eviction.
+    const showed_activity = c.pressure_monitor.active();
+    if (showed_activity) try writeActivity(c, w, s, ctx, wk, key, now, dim_line);
     // State slot for inactive workers / reserve: idle + cull countdown.
-    if (health == .inactive) try writeIdleState(c, w, s, wk, key, now);
+    if (health == .inactive) try writeIdleState(c, w, s, ctx, wk, now, showed_activity);
     if (dim_line) try s.close(w);
     try w.writeByte('\n');
     if (health != .inactive) try renderClients(c, w, s, wk, now, nested, is_last);
 }
 
-// "  idle 41m · culls in 1h19m". Called within the worker line's open dim span,
-// so base text inherits dim; only an imminent cull breaks out to amber/red and
-// then restores dim for the rest of the span. The reserve reads "ready"/"warming".
-fn writeIdleState(c: *Conductor, w: Writer, s: Style, wk: *const Worker, key: ?[]const u8, now: i64) !void {
+// Open styling for a stat value (RSS/CPU); pair with `closeStat`. With a probed
+// palette the value gets a truecolor ramp at `t_frac`, kept dim on an idle line
+// so it reads as muted. Without a palette: an idle value inherits the line's dim
+// span (returns false, no close needed); an active value is dimmed to mark it.
+fn openStat(w: Writer, s: Style, ctx: Ctx, dim_line: bool, tint: Tint, t_frac: f64) !bool {
+    if (gradientTints(s, ctx)) |t| {
+        if (dim_line) try s.open(w, ansi.dim);
+        try t.open(w, tint, t_frac);
+        return true;
+    }
+    if (dim_line) return false; // inherit the worker line's dim span
+    try s.open(w, ansi.dim);
+    return true;
+}
+
+// Close an `openStat` span: reset, then restore the line's dim span if this was
+// an idle worker (whose remaining segments still expect dim).
+fn closeStat(w: Writer, s: Style, dim_line: bool, styled: bool) !void {
+    if (!styled) return;
+    try s.close(w);
+    if (dim_line) try s.open(w, ansi.dim);
+}
+
+// "  idle 41m · culls in 1h19m" (activity, when shown, precedes this — see
+// renderWorker). Within the line's dim span; the cull countdown breaks out for
+// urgency (fg→yellow gradient, else amber/red steps) then restores dim. The
+// reserve reads "ready"/"warming".
+fn writeIdleState(c: *Conductor, w: Writer, s: Style, ctx: Ctx, wk: *const Worker, now: i64, after_activity: bool) !void {
     const is_reserve = c.reserve == wk;
-    try w.writeAll("   ");
+    // " · " continues the activity segment; "   " starts a fresh column gap.
+    try w.writeAll(if (after_activity) " · " else "   ");
     if (is_reserve) {
         try w.writeAll(if (wk.ping_pending) "warming" else "ready");
     } else {
@@ -339,23 +489,51 @@ fn writeIdleState(c: *Conductor, w: Writer, s: Style, wk: *const Worker, key: ?[
         try writeDuration(w, now - wk.last_active);
     }
     if (c.cfg.max_ttl > 0) {
-        const remaining = @as(i64, @intCast(c.cfg.max_ttl)) - (now - wk.last_active);
+        const max_ttl: i64 = @intCast(c.cfg.max_ttl);
+        const remaining = max_ttl - (now - wk.last_active);
         try w.writeAll(" · culls in ");
-        if (remaining <= 60) {
-            try s.open(w, ansi.reset ++ ansi.bold ++ ansi.red);
-            try writeDuration(w, remaining);
-            try s.open(w, ansi.dim); // restore the line's dim span
-        } else if (remaining <= 300) {
-            try s.open(w, ansi.reset ++ ansi.yellow);
-            try writeDuration(w, remaining);
-            try s.open(w, ansi.dim);
-        } else {
-            try writeDuration(w, remaining);
-        }
+        try writeCullCountdown(w, s, ctx, remaining, max_ttl);
     }
-    // Eviction warmth, only meaningful (and shown) when pressure eviction is active.
-    if (c.pressure_monitor.active()) {
-        try w.print(" · warmth {d:.2}", .{c.workerActivity(wk, key, now)});
+}
+
+// " · activity 0.42", fg→cyan as it climbs. `in_dim` restores the worker line's
+// dim span afterward (idle workers); active workers pass false.
+fn writeActivity(c: *Conductor, w: Writer, s: Style, ctx: Ctx, wk: *const Worker, key: ?[]const u8, now: i64, in_dim: bool) !void {
+    const activity = c.workerActivity(wk, key, now);
+    try w.writeAll(" · activity ");
+    if (gradientTints(s, ctx)) |t| {
+        if (in_dim) try s.open(w, ansi.reset);
+        try t.open(w, .activity, activity);
+        try w.print("{d:.2}", .{activity});
+        try s.close(w);
+        if (in_dim) try s.open(w, ansi.dim);
+    } else {
+        try w.print("{d:.2}", .{activity});
+    }
+}
+
+// The cull countdown, breaking out of and then restoring the line's dim span.
+// With a palette it ramps fg→yellow as expiry nears; without one it falls back
+// to discrete amber/red steps. `imminent` (≤60s) bolds either way.
+fn writeCullCountdown(w: Writer, s: Style, ctx: Ctx, remaining: i64, max_ttl: i64) !void {
+    const imminent = remaining <= 60;
+    if (gradientTints(s, ctx)) |t| {
+        const frac = 1.0 - @as(f64, @floatFromInt(@max(0, remaining))) / @as(f64, @floatFromInt(@max(1, max_ttl)));
+        try s.open(w, ansi.reset);
+        if (imminent) try s.open(w, ansi.bold);
+        try t.open(w, .cull, frac);
+        try writeDuration(w, remaining);
+        try s.open(w, ansi.dim);
+    } else if (imminent) {
+        try s.open(w, ansi.reset ++ ansi.bold ++ ansi.red);
+        try writeDuration(w, remaining);
+        try s.open(w, ansi.dim);
+    } else if (remaining <= 300) {
+        try s.open(w, ansi.reset ++ ansi.yellow);
+        try writeDuration(w, remaining);
+        try s.open(w, ansi.dim);
+    } else {
+        try writeDuration(w, remaining);
     }
 }
 
@@ -459,6 +637,32 @@ fn groupRss(workers: []const *Worker) u64 {
     return total;
 }
 
+// The RSS the gradient paints as fully "hot" (red). Two anchors, whichever is
+// larger:
+//   - the heaviest worker in the pool, so the busiest worker always reads hot;
+//   - each worker's padded fair share of system memory, total / (n + 8), so a
+//     pool of uniform light workers spreads across the ramp instead of all
+//     pegging red. The +8 keeps the slice sane when n is tiny (n=1 over 32G →
+//     ~3.6G, not 32G).
+// Zero only when nothing is measurable, which disables the RSS ramp.
+fn rssCeiling(c: *Conductor) u64 {
+    var max_rss: u64 = 0;
+    var n: u64 = 0;
+    var it = c.workers.iterator();
+    while (it.next()) |entry| {
+        for (entry.value_ptr.items) |wk| {
+            n += 1;
+            if (platform.getProcessStats(platform.getChildPid(wk.process))) |st| max_rss = @max(max_rss, st.rss_bytes);
+        }
+    }
+    if (c.reserve) |r| {
+        n += 1;
+        if (platform.getProcessStats(platform.getChildPid(r.process))) |st| max_rss = @max(max_rss, st.rss_bytes);
+    }
+    const fair_share: u64 = if (platform.readMemInfo()) |m| m.total / (n + 8) else 0;
+    return @max(max_rss, fair_share);
+}
+
 // A juliaup channel ("+1.11", "+release") shown as a version ("v1.11") or a
 // named channel in parentheses ("(release)"). Returns the visible width written.
 fn writeChannel(w: Writer, channel: []const u8) !usize {
@@ -527,7 +731,7 @@ fn writeWorkerJson(c: *Conductor, w: Writer, wk: *const Worker, key: ?[]const u8
     try w.print(",\"interactive\":{},\"sandboxed\":{}", .{ wk.interactive, wk.sandboxed });
     try w.print(",\"created_at\":{d},\"last_active\":{d},\"last_pinged\":{d}", .{ wk.created_at, wk.last_active, wk.last_pinged });
     try w.print(",\"ping_pending\":{},\"active_clients\":{d}", .{ wk.ping_pending, wk.active_clients });
-    try w.print(",\"warmth\":{d:.4}", .{c.workerActivity(wk, key, now)});
+    try w.print(",\"activity\":{d:.4}", .{c.workerActivity(wk, key, now)});
     if (stats) |st| {
         try w.print(",\"rss_bytes\":{d},\"cpu_seconds\":{d:.3}", .{ st.rss_bytes, st.cpu_seconds });
     } else {

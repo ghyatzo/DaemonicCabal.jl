@@ -14,6 +14,7 @@ const args = @import("args.zig");
 const project = @import("project.zig");
 const env_cache = @import("env_cache.zig");
 const status = @import("status.zig");
+const pal = @import("palette.zig");
 const pressure = @import("pressure.zig");
 pub const worker = @import("worker.zig");
 
@@ -180,6 +181,18 @@ pub const Conductor = struct {
     /// Host memory-pressure monitor (inert unless JULIA_DAEMON_MEMORY_PRESSURE).
     pressure_monitor: pressure.Monitor,
     event_loop: eventLoopImpl.EventLoop,
+    /// `--status=live` subscribers, repainted in place until they disconnect.
+    live_clients: std.ArrayList(LiveClient),
+    /// Live-repaint timer state; see noteLiveChange.
+    live_armed: bool,
+    dirty: bool,
+
+    const LiveClient = struct {
+        streams: ClientStreams, // held open across repaints
+        palette: ?pal.Palette, // probed once at subscribe
+        pid: u32, // matched for teardown on exit/interrupt
+        lines_last_printed: usize, // for the cursor-up redraw
+    };
 
     // --- Lifecycle ---
 
@@ -200,11 +213,19 @@ pub const Conductor = struct {
             .crf = std.StringHashMap(worker.Crf).init(allocator),
             .pressure_monitor = pressure.Monitor.init(&cfg),
             .event_loop = try eventLoopImpl.EventLoop.init(64),
+            .live_clients = .empty,
+            .live_armed = false,
+            .dirty = false,
         };
     }
 
     pub fn deinit(self: *Conductor) void {
         self.event_loop.deinit();
+        for (self.live_clients.items) |*lc| {
+            platform.write(lc.streams.fd(.stdout), "\r\n" ++ live_cursor_show);
+            lc.streams.deinit();
+        }
+        self.live_clients.deinit(self.allocator);
         self.cache.deinit();
         self.active_clients.deinit();
         for (self.pending_kills.items) |pk| {
@@ -318,7 +339,11 @@ pub const Conductor = struct {
             return;
         };
         const pid = std.mem.readInt(u32, buf[1..5], .little);
-        switch (@as(protocol.notification.Type, @enumFromInt(buf[0]))) {
+        const ntype = @as(protocol.notification.Type, @enumFromInt(buf[0]));
+        // A live-status subscriber leaves on ^D (exit) or ^C (interrupt); it was
+        // never assigned to a worker, so dropping it is all that's needed.
+        if ((ntype == .client_exit or ntype == .client_interrupt) and self.dropLiveClient(pid)) return;
+        switch (ntype) {
             .client_done => _ = self.clientDone(pid),
             .client_exit => {
                 if (self.clientDone(pid)) |w| {
@@ -366,13 +391,7 @@ pub const Conductor = struct {
             return;
         }
         if (request.parsed.hasSwitch("--status")) {
-            const report = status.render(self, request.parsed.getSwitch("--status"), request.flags.tty) catch |err| {
-                std.debug.print("Status: render failed: {}\n", .{err});
-                try self.serveString(socket, "Failed to generate status report.\n");
-                return;
-            };
-            defer self.allocator.free(report);
-            try self.serveString(socket, report);
+            try self.serveStatus(socket, request.parsed.getSwitch("--status"), request.flags.tty, request.pid);
             return;
         }
         // Determine sandbox mode
@@ -802,6 +821,9 @@ pub const Conductor = struct {
 
     pub fn createReserveWorker(self: *Conductor, julia_channel: ?[]const u8) !void {
         const w = try self.allocator.create(worker.Worker);
+        // Match the host's JULIA_NUM_THREADS so clients (which usually inherit it)
+        // can reuse the reserve — thread count is fixed at Julia startup, and the
+        // reuse gate requires an exact match.
         const reserve_threads = if (self.environ_map.get("JULIA_NUM_THREADS")) |v|
             args.parseThreads(v)
         else
@@ -1017,8 +1039,7 @@ pub const Conductor = struct {
     // Pure, so safe to call from the status renderer.
     pub fn workerActivity(self: *Conductor, w: *const worker.Worker, key: ?[]const u8, now: i64) f64 {
         const crf_norm = if (key) |k| worker.Crf.normalize(self.readCrf(k, now)) else 0;
-        const occ = if (w.occupancy.busy) 0 else w.occupancy.read(now, self.activityHalfLife());
-        return @max(crf_norm, occ);
+        return @max(crf_norm, w.occupancy.read(now, self.activityHalfLife()));
     }
 
     // Drop crf history. Only ever called for a TTL-culled key (gone cold); a
@@ -1460,7 +1481,39 @@ pub const Conductor = struct {
         };
     }
 
-    fn serveString(self: *Conductor, client_socket: posix.socket_t, content: []const u8) !void {
+    // The four stdio streams of a session, owning their listeners and port-set
+    // reservation; `deinit` closes everything.
+    const Stream = enum(usize) { stdin, stdout, stderr, signals };
+    const ClientStreams = struct {
+        c: *Conductor,
+        listeners: [4]protocol.Listener,
+        conns: [4]Io.net.Stream,
+        port_set_idx: u16,
+        // Owned socket paths. createListener returns a slice into a caller's
+        // stack buffer; a held live connection (and the struct's own moves)
+        // outlive it, so store length-bounded copies and never alias.
+        addrs: [4][std.fs.max_path_bytes]u8 = undefined,
+        addr_lens: [4]usize = .{ 0, 0, 0, 0 },
+
+        fn fd(self: *const ClientStreams, s: Stream) posix.socket_t {
+            return self.conns[@intFromEnum(s)].socket.handle;
+        }
+
+        fn deinit(self: *ClientStreams) void {
+            const io = self.c.io;
+            for (self.conns) |conn| conn.close(io);
+            for (&self.listeners, self.addrs[0..], self.addr_lens) |*l, *addr, len| {
+                if (self.c.cfg.transport == .unix) Io.Dir.deleteFileAbsolute(io, addr[0..len]) catch {};
+                l.server.deinit(io);
+            }
+            self.c.releasePortSet(self.port_set_idx);
+        }
+    };
+
+    // Create the four response listeners, hand their addresses to the client,
+    // and accept the connections it opens back. Caller owns the result and must
+    // `deinit` it; on any failure all partial resources are released first.
+    fn openClientStreams(self: *Conductor, client_socket: posix.socket_t) !ClientStreams {
         const mode = self.cfg.transport;
         const bind = self.cfg.bind_address;
         const rdir = self.cfg.runtime_dir;
@@ -1472,12 +1525,12 @@ pub const Conductor = struct {
                 ports = pool.portsForIndex(idx);
             }
         }
-        defer self.releasePortSet(port_set_idx);
+        errdefer self.releasePortSet(port_set_idx);
         const suffixes = [_][]const u8{ "stdin.sock", "stdout.sock", "stderr.sock", "signals.sock" };
         var bufs: [4][std.fs.max_path_bytes]u8 = undefined;
         var listeners: [4]protocol.Listener = undefined;
         var created: usize = 0;
-        defer for (listeners[0..created]) |*l| {
+        errdefer for (listeners[0..created]) |*l| {
             if (mode == .unix) Io.Dir.deleteFileAbsolute(self.io, l.addr) catch {};
             l.server.deinit(self.io);
         };
@@ -1494,16 +1547,182 @@ pub const Conductor = struct {
         });
         var conns: [4]Io.net.Stream = undefined;
         var accepted: usize = 0;
-        defer for (conns[0..accepted]) |c| c.close(self.io);
+        errdefer for (conns[0..accepted]) |c| c.close(self.io);
         for (0..4) |i| {
             conns[i] = try listeners[i].server.accept(self.io);
             accepted += 1;
         }
-        platform.write(conns[1].socket.handle, content);
-        conns[1].shutdown(self.io, .send) catch {};
-        conns[2].shutdown(self.io, .send) catch {};
-        platform.write(conns[3].socket.handle, &[_]u8{ protocol.signals.exit, 0x01, 0x00 });
-        conns[3].shutdown(self.io, .send) catch {};
+        var streams = ClientStreams{ .c = self, .listeners = listeners, .conns = conns, .port_set_idx = port_set_idx };
+        for (listeners, &streams.addrs, &streams.addr_lens) |l, *addr, *len| {
+            @memcpy(addr[0..l.addr.len], l.addr);
+            len.* = l.addr.len;
+        }
+        return streams;
+    }
+
+    fn serveString(self: *Conductor, client_socket: posix.socket_t, content: []const u8) !void {
+        var streams = try self.openClientStreams(client_socket);
+        defer streams.deinit();
+        self.finishStreams(&streams, content);
+    }
+
+    fn isLiveStatus(format: ?[]const u8) bool {
+        return format != null and std.mem.eql(u8, format.?, "live");
+    }
+
+    // Serve the `--status` report. A TTY client is colour-probed first so stat
+    // gradients track its palette; a non-answering terminal degrades to the flat
+    // report. `--status=live` holds the connection for in-place repaints rather
+    // than finishing after one frame.
+    fn serveStatus(self: *Conductor, client_socket: posix.socket_t, format: ?[]const u8, tty: bool, pid: u32) !void {
+        var streams = try self.openClientStreams(client_socket);
+        var held = false;
+        defer if (!held) streams.deinit();
+        const live = tty and isLiveStatus(format);
+        const palette: ?pal.Palette = if (tty and (format == null or live)) probePalette(&streams) else null;
+        const report = self.renderStatus(format, tty, palette) catch |err| {
+            std.debug.print("Status: render failed: {}\n", .{err});
+            self.finishStreams(&streams, "Failed to generate status report.\n");
+            return;
+        };
+        defer self.allocator.free(report.bytes);
+        platform.write(streams.fd(.stdout), report.bytes);
+        if (live) {
+            try self.subscribeLive(streams, palette, pid, report.lines);
+            held = true; // ownership moved into live_clients
+        } else {
+            self.closeStreams(&streams);
+        }
+    }
+
+    // One-shot and live frames share this, so they render identically.
+    fn renderStatus(self: *Conductor, format: ?[]const u8, tty: bool, palette: ?pal.Palette) !status.Report {
+        return status.render(self, .{
+            .format = format,
+            .tty = tty,
+            .palette = if (palette) |*p| p else null,
+        });
+    }
+
+    // --- Live repaint scheduling ---
+    //
+    // One self-perpetuating timer drives live `--status` repaints. A change with
+    // no timer armed repaints immediately (leading edge); further changes only
+    // set `dirty`, coalescing a burst. Each fire repaints, then re-arms fast if
+    // more changes arrived, else at the slow heartbeat to refresh stat numbers,
+    // and stops once no clients remain.
+    const live_debounce_ms = 100;
+    const live_heartbeat_ms = 1000;
+    const live_cursor_hide = "\x1b[?25l";
+    const live_cursor_show = "\x1b[?25h";
+
+    // First frame was sent by serveStatus; hide the cursor for the live view and
+    // start the heartbeat (dirty stays false, so no redundant immediate repaint).
+    fn subscribeLive(self: *Conductor, streams: ClientStreams, palette: ?pal.Palette, pid: u32, lines: usize) !void {
+        try self.live_clients.append(self.allocator, .{
+            .streams = streams,
+            .palette = palette,
+            .pid = pid,
+            .lines_last_printed = lines,
+        });
+        platform.write(streams.fd(.stdout), live_cursor_hide);
+        if (!self.live_armed) {
+            self.event_loop.armLiveTimer(live_heartbeat_ms);
+            self.live_armed = true;
+        }
+    }
+
+    pub fn noteLiveChange(self: *Conductor) void {
+        if (self.live_clients.items.len == 0) return;
+        self.dirty = true;
+        if (!self.live_armed) self.fireLive();
+    }
+
+    pub fn onLiveTimer(self: *Conductor) void {
+        self.live_armed = false;
+        self.fireLive();
+    }
+
+    // A disconnected client is reaped via its exit/interrupt notification, not here.
+    fn fireLive(self: *Conductor) void {
+        if (self.live_clients.items.len == 0) return;
+        const had_change = self.dirty;
+        self.dirty = false;
+        for (self.live_clients.items) |*lc| self.repaintOne(lc);
+        self.event_loop.armLiveTimer(if (had_change) live_debounce_ms else live_heartbeat_ms);
+        self.live_armed = true;
+    }
+
+    fn repaintOne(self: *Conductor, lc: *LiveClient) void {
+        const report = self.renderStatus("live", true, lc.palette) catch return;
+        defer self.allocator.free(report.bytes);
+        const fd = lc.streams.fd(.stdout);
+        // Wrap in a synchronized update (DEC 2026) so the terminal applies the
+        // whole frame atomically — no tearing. ESC[<n>F moves up to column 0 of
+        // the prior frame; ESC[0J clears down so a shorter frame leaves no tail.
+        var hdr: [32]u8 = undefined;
+        const prefix = if (lc.lines_last_printed > 0)
+            std.fmt.bufPrint(&hdr, "\x1b[?2026h\x1b[{d}F\x1b[0J", .{lc.lines_last_printed}) catch unreachable
+        else
+            "\x1b[?2026h";
+        platform.write(fd, prefix);
+        platform.write(fd, report.bytes);
+        platform.write(fd, "\x1b[?2026l");
+        lc.lines_last_printed = report.lines;
+    }
+
+    // Remove the live client with `pid` (if any), restoring its cursor. Returns
+    // whether one was found.
+    fn dropLiveClient(self: *Conductor, pid: u32) bool {
+        for (self.live_clients.items, 0..) |*lc, i| {
+            if (lc.pid != pid) continue;
+            var removed = self.live_clients.swapRemove(i);
+            // Newline below the final frame, then restore the cursor, so the
+            // shell prompt lands cleanly under the frozen snapshot.
+            platform.write(removed.streams.fd(.stdout), "\r\n" ++ live_cursor_show);
+            removed.streams.deinit();
+            return true;
+        }
+        return false;
+    }
+
+    // Write `content` to stdout, then shut down stdout/stderr and signal a clean
+    // exit. Shared by the report and failure paths.
+    fn finishStreams(self: *Conductor, streams: *ClientStreams, content: []const u8) void {
+        platform.write(streams.fd(.stdout), content);
+        self.closeStreams(streams);
+    }
+
+    // Shut down stdout/stderr and signal a clean client exit (no content write).
+    fn closeStreams(self: *Conductor, streams: *ClientStreams) void {
+        streams.conns[@intFromEnum(Stream.stdout)].shutdown(self.io, .send) catch {};
+        streams.conns[@intFromEnum(Stream.stderr)].shutdown(self.io, .send) catch {};
+        platform.write(streams.fd(.signals), &[_]u8{ protocol.signals.exit, 0x01, 0x00 });
+        streams.conns[@intFromEnum(Stream.signals)].shutdown(self.io, .send) catch {};
+    }
+
+    // Probe the terminal palette: raw mode (so replies arrive un-echoed), write
+    // the queries to stdout, read stdin until the CSI 5n sentinel, restore
+    // cooked mode. Returns the palette if any colour reply parsed, else null.
+    // The sentinel (or a byte cap) bounds the read so it can't hang.
+    fn probePalette(streams: *ClientStreams) ?pal.Palette {
+        const stdin = streams.fd(.stdin);
+        const signals = streams.fd(.signals);
+        platform.write(signals, &[_]u8{ protocol.signals.raw_mode, 0x01, 0x01 });
+        defer platform.write(signals, &[_]u8{ protocol.signals.raw_mode, 0x01, 0x00 });
+        var qbuf: [pal.query_buf_len]u8 = undefined;
+        platform.write(streams.fd(.stdout), pal.writeQueries(&qbuf));
+        var buf: [4096]u8 = undefined;
+        var len: usize = 0;
+        while (len < buf.len) {
+            const n = platform.socketRead(stdin, buf[len..]);
+            if (n == 0) break;
+            len += n;
+            if (std.mem.indexOf(u8, buf[0..len], pal.sentinel) != null) break;
+        }
+        var palette: pal.Palette = .{};
+        pal.parse(buf[0..len], &palette);
+        return if (palette.isPopulated()) palette else null;
     }
 
     fn sendSocketPaths(self: *Conductor, socket: posix.socket_t, paths: worker.Worker.SocketPaths) void {

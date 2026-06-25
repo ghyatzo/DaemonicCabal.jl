@@ -27,6 +27,7 @@ const SIGNAL_RECREATE = posix_signals.SIGNAL_RECREATE;
 pub const EventLoop = struct {
     ring: linux.IoUring,
     health_check_ts: linux.kernel_timespec,
+    live_ts: linux.kernel_timespec = .{ .sec = 0, .nsec = 0 },
 
     pub fn init(entries: u13) !EventLoop {
         return .{
@@ -37,6 +38,12 @@ pub const EventLoop = struct {
 
     pub fn deinit(self: *EventLoop) void {
         self.ring.deinit();
+    }
+
+    /// Arm the unified live-repaint timer `delay_ms` out (Conductor picks the delay).
+    pub fn armLiveTimer(self: *EventLoop, delay_ms: u64) void {
+        self.live_ts = .{ .sec = @intCast(delay_ms / 1000), .nsec = @intCast((delay_ms % 1000) * std.time.ns_per_ms) };
+        _ = self.ring.timeout(@intFromEnum(EventLocation.live_timer), &self.live_ts, 0, 0) catch {};
     }
 
     /// Schedule a health check for a worker after a short delay.
@@ -101,6 +108,9 @@ pub fn run(conductor: *Conductor, server: *Io.net.Server) void {
         var need_rearm_accept = false;
         var need_rearm_ping_timer = false;
         var need_rearm_pressure_timer = false;
+        // Any completion other than the live timers themselves may have changed
+        // what a live `--status` view shows; one repaint is scheduled per batch.
+        var pool_changed = false;
         while (ring.cq_ready() > 0) {
             const cqe = ring.copy_cqe() catch |err| {
                 std.debug.print("Fatal: io_uring copy_cqe failed: {}\n", .{err});
@@ -119,6 +129,7 @@ pub fn run(conductor: *Conductor, server: *Io.net.Server) void {
                 } else {
                     handlePongResponse(conductor, w, cqe.res);
                 }
+                pool_changed = true;
                 continue;
             }
             switch (@as(EventLocation, @enumFromInt(user_data))) {
@@ -138,6 +149,7 @@ pub fn run(conductor: *Conductor, server: *Io.net.Server) void {
                         }
                     }
                     need_rearm_accept = true;
+                    pool_changed = true;
                 },
                 .signal => {
                     if (cqe.res > 0) {
@@ -174,15 +186,19 @@ pub fn run(conductor: *Conductor, server: *Io.net.Server) void {
                     conductor.enforceMaxTtl();
                     queueWorkerPings(conductor, ring, &ping_timeout_ts);
                     need_rearm_ping_timer = true;
+                    pool_changed = true;
                 },
                 .pressure_timer => {
                     conductor.sweepPendingKills();
                     conductor.runEvictionEpisode();
                     need_rearm_pressure_timer = true;
+                    pool_changed = true;
                 },
+                .live_timer => conductor.onLiveTimer(),
                 .ignored, _ => {},
             }
         }
+        if (pool_changed) conductor.noteLiveChange();
         if (need_rearm_accept) {
             client_addr_len = @sizeOf(posix.sockaddr);
             _ = ring.accept(@intFromEnum(EventLocation.accept), server_fd, &client_addr, &client_addr_len, 0) catch |err| {

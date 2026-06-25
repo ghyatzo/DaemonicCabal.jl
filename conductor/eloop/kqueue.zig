@@ -39,9 +39,11 @@ const UDATA_ACCEPT: usize = 0;
 const UDATA_SIGNAL: usize = 1;
 const UDATA_PING_TIMER: usize = 2;
 const UDATA_PRESSURE_TIMER: usize = 4;
+const UDATA_LIVE_TIMER: usize = 5;
 // Unique idents for periodic timers (won't collide with file descriptors)
 const TIMER_IDENT_PING: usize = 0xFFFF_0001;
 const TIMER_IDENT_PRESSURE: usize = 0xFFFF_0002;
+const TIMER_IDENT_LIVE: usize = 0xFFFF_0003;
 
 // EventLoop (wraps kqueue fd + configuration)
 pub const EventLoop = struct {
@@ -61,6 +63,12 @@ pub const EventLoop = struct {
 
     pub fn deinit(self: *EventLoop) void {
         _ = c.close(self.kq);
+    }
+
+    /// Arm the unified live-repaint timer `delay_ms` out (Conductor picks the delay).
+    pub fn armLiveTimer(self: *EventLoop, delay_ms: u64) void {
+        var ch = [1]c.Kevent{makeKevent(TIMER_IDENT_LIVE, c.EVFILT.TIMER, c.EV.ADD | c.EV.ONESHOT, 0, @intCast(delay_ms), UDATA_LIVE_TIMER)};
+        _ = keventSubmit(self.kq, &ch);
     }
 
     /// Schedule a health check for a worker after a short delay (1 second).
@@ -149,6 +157,9 @@ pub fn run(conductor: *Conductor, server: *Io.net.Server) void {
             return;
         }
         const event_count: usize = @intCast(nevents);
+        // Any event other than the live timers themselves may have changed what
+        // a live `--status` view shows; one repaint is scheduled per batch.
+        var pool_changed = false;
         for (events[0..event_count]) |ev| {
             // Check for errors on this event
             if ((ev.flags & EV_ERROR) != 0) {
@@ -159,19 +170,24 @@ pub fn run(conductor: *Conductor, server: *Io.net.Server) void {
             switch (udata) {
                 UDATA_ACCEPT => {
                     handleAccept(conductor, server_fd);
+                    pool_changed = true;
                 },
                 UDATA_SIGNAL => {
                     if (handleSignal(conductor, server, &server_fd, kq, &signal_buf)) return;
+                    pool_changed = true;
                 },
                 UDATA_PING_TIMER => {
                     if (!pressure_active) conductor.sweepPendingKills();
                     conductor.enforceMaxTtl();
                     queueWorkerPings(conductor, kq);
+                    pool_changed = true;
                 },
                 UDATA_PRESSURE_TIMER => {
                     conductor.sweepPendingKills();
                     conductor.runEvictionEpisode();
+                    pool_changed = true;
                 },
+                UDATA_LIVE_TIMER => conductor.onLiveTimer(),
                 else => {
                     // Worker event: udata is (worker_ptr | tag); bit 0: 0 = pong
                     // read/timeout, 1 = health check timeout.
@@ -188,9 +204,11 @@ pub fn run(conductor: *Conductor, server: *Io.net.Server) void {
                         // EVFILT_READ: pong data ready
                         handlePongReady(conductor, kq, w);
                     }
+                    pool_changed = true;
                 },
             }
         }
+        if (pool_changed) conductor.noteLiveChange();
     }
 }
 
