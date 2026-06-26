@@ -62,6 +62,7 @@ const WORKER_TERM = VirtualTerm(
 const ACTIVE_TERM = ScopedValue{VirtualTerm}(WORKER_TERM)
 const CLIENT_MODULE = ScopedValue{Module}(Main)
 const CLIENT_REPL = ScopedValue(Ref{REPL.LineEditREPL}())
+const REPLAY_TARGET = ScopedValue{Union{Nothing, Tuple{StreamIO, SyncSession}}}(nothing)
 
 struct ScopedStdin <: Base.AbstractPipe end
 struct ScopedStdout <: Base.AbstractPipe end
@@ -87,13 +88,17 @@ function Base.get(::Union{ScopedStdout, ScopedStderr}, key::Symbol, default)
     end
 end
 
+const DEFAULT_DISPLAYSIZE = (24, 80)
+
 function query_displaysize(signals::StreamIO)
     send_signal(signals, SIGNAL_QUERY_SIZE, UInt8[])
     # Response: id(1) + len(1) + height(2) + width(2)
     resp = read(signals, 6)
+    length(resp) == 6 || return DEFAULT_DISPLAYSIZE
     height = reinterpret(UInt16, resp[3:4])[1]
     width = reinterpret(UInt16, resp[5:6])[1]
-    (Int(height), Int(width))
+    (if iszero(height) first(DEFAULT_DISPLAYSIZE) else Int(height) end,
+     if iszero(width) last(DEFAULT_DISPLAYSIZE) else Int(width) end)
 end
 # In sync mode, query all clients and return component-wise minimum (like tmux).
 function Base.displaysize(::Union{ScopedStdout, ScopedStderr})
@@ -108,12 +113,12 @@ function Base.displaysize(::Union{ScopedStdout, ScopedStderr})
             min_w = min(min_w, w)
         end
         if min_h == typemax(Int)
-            (24, 80)
+            DEFAULT_DISPLAYSIZE
         else
             (min_h, min_w)
         end
     else
-        isopen(term.signals) || return (24, 80)
+        isopen(term.signals) || return DEFAULT_DISPLAYSIZE
         query_displaysize(term.signals)
     end
 end
