@@ -55,10 +55,6 @@ pub const CookedState = struct {
     }
 
     fn closeSocket(fd: posix.socket_t) void {
-        if (builtin.os.tag == .windows) {
-            _ = std.os.windows.ws2_32.closesocket(fd);
-        } else {
-            platform.close(fd);
-        }
+        platform.close(fd); // closesocket on Windows, close on POSIX
     }
 };

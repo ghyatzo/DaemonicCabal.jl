@@ -34,10 +34,12 @@ pub const worker = struct {
         sockets = 0x21,
         query_state = 0x30,
         state = 0x31,
+        query_clients = 0x32,
+        clients = 0x33,
         soft_exit = 0x40,
         ack = 0x41,
         sync_clients = 0x50, // Conductor sends list of active PIDs; worker kills any not in list
-        interrupt_client = 0x60, // Conductor tells worker to interrupt a client's task. Payload: pid (u32)
+        drop_session = 0x51, // Conductor: session label expired; tear down its REPL. Payload: label (u16-len + bytes)
         err = 0xFF,
     };
 
@@ -228,7 +230,7 @@ pub const Address = struct {
 
 /// Disable Nagle's algorithm on a TCP socket.
 pub fn setTcpNodelay(fd: std.posix.socket_t) void {
-    std.posix.setsockopt(fd, 6, 1, std.mem.asBytes(&@as(c_int, 1))) catch {};
+    platform.setTcpNodelay(fd); // IPPROTO_TCP=6, TCP_NODELAY=1
 }
 
 /// Detect transport mode from address string, stripping any `tcp://` scheme prefix.

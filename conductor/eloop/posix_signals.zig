@@ -49,6 +49,15 @@ pub fn installSignalHandlers() !void {
         .flags = 0,
     };
     posix.sigaction(posix.SIG.USR1, &usr1_sigact, null);
+    // A client whose terminal closed mid-request leaves the daemon writing to a
+    // dead socket; ignore SIGPIPE so that write returns EPIPE rather than killing
+    // the (shared) daemon. Linux io_uring masks this already; macOS c.write does not.
+    const pipe_sigact = posix.Sigaction{
+        .handler = .{ .handler = posix.SIG.IGN },
+        .mask = std.mem.zeroes(posix.sigset_t),
+        .flags = 0,
+    };
+    posix.sigaction(posix.SIG.PIPE, &pipe_sigact, null);
 }
 
 /// Close signal pipe. Call after event loop exits.
