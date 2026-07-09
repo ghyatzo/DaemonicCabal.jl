@@ -3,7 +3,7 @@
 
 using Base.ScopedValues
 
-const OutputIO = Union{Base.PipeEndpoint, Sockets.TCPSocket, BroadcastWriter{StreamIO}}
+const OutputIO = Union{Base.PipeEndpoint, Sockets.TCPSocket, BroadcastWriter{StreamIO}, BufferedOutput{Base.PipeEndpoint}, BufferedOutput{Sockets.TCPSocket}}
 
 mutable struct VirtualTerm
     const stdin::StreamIO

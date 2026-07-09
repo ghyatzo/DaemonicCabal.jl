@@ -129,6 +129,12 @@ function clienthascolor(client::ClientInfo)
     end
 end
 
+function is_repl_client(client::ClientInfo)
+    switches = (s for (s, _) in client.switches)
+    # A client drops into the REPL unless it gave code to run (-e/-E) or a program file.
+    "-i" ∈ switches || (isnothing(client.programfile) && "--eval" ∉ switches && "--print" ∉ switches)
+end
+
 function runclient(client::ClientInfo, client_stdin::StreamIO,
                    client_stdout::IO, client_stderr::IO,
                    signals::StreamIO;
@@ -138,7 +144,17 @@ function runclient(client::ClientInfo, client_stdin::StreamIO,
                    broadcast::Union{Nothing, BroadcastWriter{StreamIO}}=nothing,
                    replay::Union{Nothing, Tuple{StreamIO, SyncSession}}=nothing)
     hascolor = clienthascolor(client)
-    stdoutx = IOContext(client_stdout, :color => hascolor)
+    # Buffer stdout only for non-interactive clients: a REPL prompt is small and is
+    # written just before the frontend blocks on stdin, so buffering would strand it
+    # (the prompt never reaches the client). Bulk `print` throughput — the reason to
+    # buffer — is a non-interactive concern. teardown owns the buffer via owned_streams.
+    client_stdout_b, owned_streams = if !is_repl_client(client) && client_stdout isa Union{Base.PipeEndpoint, Sockets.TCPSocket}
+        buffered = BufferedOutput(client_stdout)
+        buffered, map(s -> if s === client_stdout; buffered else s end, owned_streams)
+    else
+        client_stdout, owned_streams
+    end
+    stdoutx = IOContext(client_stdout_b, :color => hascolor)
     stderrx = IOContext(client_stderr, :color => hascolor)
     mod = prepare_module(client)
     exit_code = 0
@@ -168,7 +184,7 @@ function runclient(client::ClientInfo, client_stdin::StreamIO,
                     hascolor
                 end
                 client_vterm = VirtualTerm(
-                    client_stdin, client_stdout, client_stderr, signals,
+                    client_stdin, client_stdout_b, client_stderr, signals,
                     term, sync_session,
                     get(TERMINFOS, term, nothing), color, nothing)
                 with(ACTIVE_TERM => client_vterm,
@@ -196,7 +212,7 @@ function runclient(client::ClientInfo, client_stdin::StreamIO,
         # landing mid uv_write in teardown would siglongjmp out of libuv and
         # corrupt the task fiber, so the stream I/O must be async-interrupt-atomic.
         Base.disable_sigint() do
-            teardown_client(client, client_stdin, client_stdout, client_stderr,
+            teardown_client(client, client_stdin, client_stdout_b, client_stderr,
                             signals, owned_streams, exit_code)
         end
     end
@@ -228,9 +244,7 @@ end
 function runclient(mod::Module, client::ClientInfo; stdout::IO=stdout,
                    broadcast::Union{Nothing, BroadcastWriter{StreamIO}}=nothing)
     set_switches = [s for (s, _) in client.switches]
-    runrepl = "-i" ∈ set_switches ||
-        (isnothing(client.programfile) && "--eval" ∉ set_switches &&
-        "--print" ∉ set_switches)
+    runrepl = is_repl_client(client)
     for (switch, value) in client.switches
         if switch == "--eval"
             Core.eval(mod, Base.parse_input_line(value))
