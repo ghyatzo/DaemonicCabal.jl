@@ -138,7 +138,13 @@ function runclient(client::ClientInfo, client_stdin::StreamIO,
                    broadcast::Union{Nothing, BroadcastWriter{StreamIO}}=nothing,
                    replay::Union{Nothing, Tuple{StreamIO, SyncSession}}=nothing)
     hascolor = clienthascolor(client)
-    stdoutx = IOContext(client_stdout, :color => hascolor)
+    client_stdout_b, owned_streams = if client_stdout isa Union{Base.PipeEndpoint, Sockets.TCPSocket}
+        buffered = BufferedOutput(client_stdout)
+        buffered, map(s -> if s === client_stdout; buffered else s end, owned_streams)
+    else
+        client_stdout, owned_streams
+    end
+    stdoutx = IOContext(client_stdout_b, :color => hascolor)
     stderrx = IOContext(client_stderr, :color => hascolor)
     mod = prepare_module(client)
     exit_code = 0
@@ -168,7 +174,7 @@ function runclient(client::ClientInfo, client_stdin::StreamIO,
                     hascolor
                 end
                 client_vterm = VirtualTerm(
-                    client_stdin, client_stdout, client_stderr, signals,
+                    client_stdin, client_stdout_b, client_stderr, signals,
                     term, sync_session,
                     get(TERMINFOS, term, nothing), color, nothing)
                 with(ACTIVE_TERM => client_vterm,
@@ -196,7 +202,7 @@ function runclient(client::ClientInfo, client_stdin::StreamIO,
         # landing mid uv_write in teardown would siglongjmp out of libuv and
         # corrupt the task fiber, so the stream I/O must be async-interrupt-atomic.
         Base.disable_sigint() do
-            teardown_client(client, client_stdin, client_stdout, client_stderr,
+            teardown_client(client, client_stdin, client_stdout_b, client_stderr,
                             signals, owned_streams, exit_code)
         end
     end

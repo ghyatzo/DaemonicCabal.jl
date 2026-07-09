@@ -26,10 +26,8 @@ struct SyncSession
     repl::Base.RefValue{REPL.LineEditREPL}
 end
 
-@static if VERSION >= v"1.11"
-    include("scopedio.jl")
-end
-
+include("bufferedio.jl")
+@static VERSION >= v"1.11" && include("scopedio.jl")
 include("protocol.jl")
 include("setup.jl")
 include("run.jl")
