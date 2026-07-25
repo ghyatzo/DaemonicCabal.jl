@@ -3,7 +3,7 @@
 
 const SOURCE_WORKER_PROJECT = joinpath(dirname(dirname(@__DIR__)), "worker")
 
-install_dir() = BaseDirs.User.data(BaseDirs.Project("julia-daemon"), create=false)
+install_dir() = BaseDirs.User.data(BaseDirs.App("julia-daemon"), create=false)
 installed_worker_project() = joinpath(install_dir(), "worker")
 installed_conductor() = joinpath(install_dir(), "julia-conductor")
 installed_client() = joinpath(install_dir(), "juliaclient")
@@ -106,7 +106,7 @@ BaseDirs.@promise_no_assign @doc """
 
 Install the daemon and client on this machine.
 
-Installs files to `$(BaseDirs.User.data(BaseDirs.Project("julia-daemon"), create=false))`,
+Installs files to `$(BaseDirs.User.data(BaseDirs.App("julia-daemon"), create=false))`,
 sets up a platform-specific service (systemd on Linux, launchd on macOS,
 manual instructions on BSD), and symlinks the client to
 `$(BaseDirs.User.bin(CLIENT_NAME))`.
