@@ -264,7 +264,10 @@ function runclient(mod::Module, client::ClientInfo; stdout::IO=stdout,
             else
                 Base.include(mod, client.programfile)
             end
-        catch
+        catch err
+            # `exit(n)` is not a failure; `include` wraps it on the way out.
+            thrown = if err isa LoadError err.error else err end
+            thrown isa DaemonClientExit && throw(thrown)
             Base.invokelatest(
                 Base.display_error,
                 Base.scrub_repl_backtrace(

@@ -136,6 +136,12 @@ const SignalParser = struct {
                 platform.socketWrite(fd, &[_]u8{ id, 0 }); // ack: id + len:u8=0
                 break :blk .none;
             },
+            protocol.signals.executing => blk: {
+                // Unacknowledged: the worker does not read a reply, and a stray one
+                // would be consumed by the next raw_mode ack.
+                if (data.len == 1) platform.setWorkerExecuting(data[0] != 0);
+                break :blk .none;
+            },
             protocol.signals.query_size => blk: {
                 const size = getTerminalSize();
                 var resp: [6]u8 = undefined;

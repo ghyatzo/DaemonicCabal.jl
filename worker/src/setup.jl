@@ -51,7 +51,7 @@ end
 # Orphan failsafe: exit if the conductor has gone silent too long. Not an idle
 # policy (the conductor owns that) — only fires when the conductor truly died
 # without pdeathsig catching it (non-Linux, or an unclean crash). `last_contact`
-# is refreshed on every conductor message (see runworker).
+# is refreshed on every conductor message (see `runworker`).
 
 function queue_orphan_check()
     ORPHAN_FAILSAFE > 0 || return
@@ -113,9 +113,49 @@ const SIGNAL_EXIT = 0x01
 const SIGNAL_RAW_MODE = 0x02   # data: 0x00 = cooked, 0x01 = raw
 const SIGNAL_QUERY_SIZE = 0x03 # response: height(u16) + width(u16)
 const SIGNAL_NODELAY = 0x04    # disable Nagle on stdin+signals (low-latency connection)
+const SIGNAL_EXECUTING = 0x05  # data: 0x00 = at prompt, 0x01 = evaluating
 
+# One write per frame: a multi-argument `write` yields between arguments, letting
+# concurrent senders (raw! on the REPL frontend, signal_executing on the backend)
+# interleave mid-frame.
 function send_signal(io::IO, id::UInt8, data::Vector{UInt8})
-    write(io, id, UInt8(length(data)), data)
+    frame = Vector{UInt8}(undef, 2 + length(data))
+    frame[1], frame[2] = id, length(data)
+    copyto!(frame, 3, data)
+    write(io, frame)
+end
+
+"""
+    signal_executing(executing::Bool)
+
+Tell the active client whether user code is evaluating, so it can route Ctrl-C.
+
+Raw mode cannot stand in for this: LineEdit holds the terminal raw across
+evaluation. Unacknowledged, so a slow client cannot stall the REPL; sync
+sessions are excluded.
+"""
+@static if VERSION >= v"1.11"
+    function signal_executing(executing::Bool)
+        term = ACTIVE_TERM[]
+        isnothing(term.sync_session) || return
+        # Outside a client session this is WORKER_TERM, whose pipe is never opened.
+        isopen(term.signals) || return
+        # `isopen` lags a peer close, so a client leaving mid-evaluation throws here.
+        try send_signal(term.signals, SIGNAL_EXECUTING, UInt8[executing])
+        catch err
+            err isa Base.IOError || rethrow()
+        end
+    end
+else
+    function signal_executing(executing::Bool)
+        sig = CLIENT_SIGNALS[]
+        isnothing(sig) && return
+        isopen(sig) || return
+        try send_signal(sig, SIGNAL_EXECUTING, UInt8[executing])
+        catch err
+            err isa Base.IOError || rethrow()
+        end
+    end
 end
 
 # Copied from `init_active_project()` in `base/initdefs.jl`.
@@ -356,7 +396,7 @@ function spawn_interactive_sync_client!(client::ClientInfo, client_stdin::Stream
     else
         # First REPL: run the shared REPL frontend on this client, replaying prior
         # scrollback after the banner (REPLAY_TARGET → atreplinit hook).
-        Threads.@spawn :interactive try
+        @async try # thread 0 for Ctrl-C; see `spawn_client!`
             runclient(client, session.mergedin, session.out, session.err, signals;
                       owned_streams=(), sync_session=session, repl_ref=session.repl,
                       replay=(client_stdout, session))
@@ -377,7 +417,7 @@ function spawn_eval_sync_client!(client::ClientInfo, client_stdin::StreamIO,
                                  client_stdout::StreamIO, client_stderr::StreamIO,
                                  signals::StreamIO, session::SyncSession)
     has_repl = isassigned(session.repl) && session.repl[].mistate !== nothing
-    task = Threads.@spawn :interactive begin
+    task = @async begin # thread 0 for Ctrl-C; see `spawn_client!`
         clear_repl_input(session, has_repl)
         sync_echo_expressions(session, client)
         try
@@ -459,7 +499,9 @@ function spawn_client!(conn::IO, client::ClientInfo)
     end
     label = sync_session_label(client)
     if isnothing(label)
-        task = Threads.@spawn :interactive try
+        # @async, not Threads.@spawn: jl_try_deliver_sigint only ever targets
+        # thread 0, so a client task anywhere else can never be Ctrl-C'd.
+        task = @async try
             runclient(client, client_stdin, client_stdout, client_stderr, signals)
         catch
             isopen(client_stdout) && rethrow()
@@ -574,10 +616,8 @@ function runworker(socketpath::String, worker_number::Int=-1, conductor_address:
     try
         verify_magic(conn)
         while isopen(conn)
-            # A trailing force-thrown SIGINT (from interrupting a client's tight
-            # loop) can land anywhere in an iteration after the client task ended.
-            # Swallow it and keep serving — only conductor disconnect / soft_exit
-            # ends the worker.
+            # A client's Ctrl-C can be delivered to this task; absorb it and keep
+            # serving, so only a disconnect or soft_exit ends the worker.
             try
                 header = read_header(conn)
                 @lock STATE.lock STATE.last_contact[] = time()
@@ -588,7 +628,7 @@ function runworker(socketpath::String, worker_number::Int=-1, conductor_address:
         end
     catch err
         # Conductor disconnect is a clean end; anything else is a worker fault.
-        if !(err isa EOFError || err isa Base.IOError || err isa InterruptException)
+        if !(err isa EOFError || err isa Base.IOError)
             @error "Worker error" exception=(err, catch_backtrace())
             exit_code = 1
         end

@@ -80,6 +80,7 @@ pub const signals = struct {
     pub const raw_mode: u8 = 0x02;   // data: 0x00 = cooked, 0x01 = raw
     pub const query_size: u8 = 0x03; // response: height(u16) + width(u16)
     pub const nodelay: u8 = 0x04;    // disable Nagle on stdin+signals (low-latency connection)
+    pub const executing: u8 = 0x05;  // data: 0x00 = at prompt, 0x01 = evaluating
 };
 
 // Event user_data encoding for io_uring:

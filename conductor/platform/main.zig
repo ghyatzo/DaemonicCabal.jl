@@ -71,6 +71,9 @@ pub const setRawMode = if (os != .windows) shared.setRawModeStdin else impl.setR
 pub const setWorkerRawMode = if (os != .windows) shared.setWorkerRawMode else struct {
     fn f(_: bool) void {}
 }.f;
+pub const setWorkerExecuting = if (os != .windows) shared.setWorkerExecuting else struct {
+    fn f(_: bool) void {}
+}.f;
 
 // Time (common implementation)
 pub fn timeSeconds(io: Io) i64 {

@@ -103,13 +103,13 @@ pub fn setRawMode(stdin: posix.fd_t, raw: bool) void {
 
 // Signal handling
 //
-// Worker raw mode tracking: the worker toggles the client's terminal between
-// raw mode (REPL reading input) and cooked mode (code executing) via the
-// signals socket. This flag tracks the worker's intent so the SIGINT handler
-// can choose the right path — write \x03 to stdin (raw/REPL) or send an
-// interrupt notification via the conductor (cooked/executing).
+// Worker state tracking, reported over the signals socket: whether the client's
+// terminal is raw (REPL reading input) or cooked, and whether user code is
+// evaluating. The SIGINT handler routes on the latter.
 var worker_raw: bool = false;
 pub fn setWorkerRawMode(raw: bool) void { worker_raw = raw; }
+var worker_executing: bool = false;
+pub fn setWorkerExecuting(executing: bool) void { worker_executing = executing; }
 pub const SignalHandler = struct {
     sockets_ptr: *anyopaque,
     write_fn: *const fn (*anyopaque, []const u8) void,
@@ -130,10 +130,10 @@ fn signalAction(sig: posix.SIG, _: *const posix.siginfo_t, _: ?*anyopaque) callc
     const handler = g_signal_handler orelse return;
     switch (sig) {
         .INT => {
-            // In raw mode the REPL is reading input — \x03 triggers LineEdit's ^C binding.
-            // In cooked mode code is executing — route through the conductor to deliver
-            // InterruptException to the running task.
-            if (worker_raw)
+            // \x03 only reaches LineEdit at the prompt; while code runs nothing is
+            // reading stdin. Never coalesce: Julia's force-throw for tight loops
+            // needs the repeated presses to accumulate.
+            if (worker_raw and !worker_executing)
                 handler.writeStdio("\x03")
             else
                 handler.notifyInterrupt();

@@ -42,9 +42,14 @@
             end
             display(exit)
         else
-            printstyled(io, "ERROR: ", bold=true, color=Base.error_color())
-            Base.show_exception_stack(IOContext(io, :limit => true),stack)
-            println(io)
+            # `print_response` leaves interrupts on here to let a long trace be cut
+            # short; relayed Ctrl-Cs keep landing after the loop breaks, so without
+            # this the render is lost to the interrupt that prompted it.
+            Base.disable_sigint() do
+                printstyled(io, "ERROR: ", bold=true, color=Base.error_color())
+                Base.show_exception_stack(IOContext(io, :limit => true), stack)
+                println(io)
+            end
         end
     end
 end
@@ -159,7 +164,12 @@ end
                 continue
             end
         end
-        eval_user_input(ast_or_func, backend, get_module())
+        $signal_executing(true)
+        try
+            eval_user_input(ast_or_func, backend, get_module())
+        finally
+            $signal_executing(false)
+        end
     end
 end
 
