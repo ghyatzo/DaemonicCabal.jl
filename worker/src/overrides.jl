@@ -174,3 +174,21 @@ end
 end
 
 @eval Base.exit(n) = throw(DaemonClientExit(n))
+
+# Base spawns children on fds 0/1/2, which belong to the conductor, not the
+# client. Interactive sessions leave stdin closed, and a closed handle would
+# fail the spawn with EINVAL.
+function spawn_stdin()
+    reader = Base.pipe_reader(Base.stdin)
+    if reader isa Base.PipeEndpoint && reader.status == Base.StatusClosed
+        return devnull
+    end
+    Base.stdin
+end
+
+@eval Base.spawn_opts_inherit(
+    in::Base.Redirectable = $(spawn_stdin)(),
+    out::Base.Redirectable = Base.stdout,
+    err::Base.Redirectable = Base.stderr,
+    extra::Base.Redirectable...,
+) = Base.Redirectable[in, out, err, extra...]
