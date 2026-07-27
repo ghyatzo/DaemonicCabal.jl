@@ -15,7 +15,13 @@ mutable struct VirtualTerm
     terminfo::Union{Nothing, Base.TermInfo}
     have_color::Union{Nothing, Bool}
     have_truecolor::Union{Nothing, Bool}
+    redirect_in::Union{Nothing, IO}
+    redirect_out::Union{Nothing, IO}
+    redirect_err::Union{Nothing, IO}
 end
+VirtualTerm(stdin, stdout, stderr, signals, term, sync_session, terminfo, have_color, have_truecolor) =
+    VirtualTerm(stdin, stdout, stderr, signals, term, sync_session,
+                terminfo, have_color, have_truecolor, nothing, nothing, nothing)
 
 function unsafe_pipe!(pipe::Base.PipeEndpoint, tty::Base.TTY)
     Base.disassociate_julia_struct(pipe.handle)
@@ -68,9 +74,23 @@ struct ScopedStdin <: Base.AbstractPipe end
 struct ScopedStdout <: Base.AbstractPipe end
 struct ScopedStderr <: Base.AbstractPipe end
 
-Base.pipe_reader(::ScopedStdin) = ACTIVE_TERM[].stdin
-Base.pipe_writer(::ScopedStdout) = ACTIVE_TERM[].stdout
-Base.pipe_writer(::ScopedStderr) = ACTIVE_TERM[].stderr
+Base.pipe_reader(::ScopedStdin) = @something(ACTIVE_TERM[].redirect_in, ACTIVE_TERM[].stdin)
+Base.pipe_writer(::ScopedStdout) = @something(ACTIVE_TERM[].redirect_out, ACTIVE_TERM[].stdout)
+Base.pipe_writer(::ScopedStderr) = @something(ACTIVE_TERM[].redirect_err, ACTIVE_TERM[].stderr)
+
+# A `ScopedStd*` argument is the worker installing its own globals, not a client
+# redirect, so it clears the slot.
+function set_redirect!(f::Base.RedirectStdStream, io)
+    slot, wrapper = if f.unix_fd == 0
+        :redirect_in, ScopedStdin
+    elseif f.unix_fd == 1
+        :redirect_out, ScopedStdout
+    else
+        :redirect_err, ScopedStderr
+    end
+    setfield!(ACTIVE_TERM[], slot, io isa wrapper ? nothing : io)
+    io
+end
 
 # See `overrides.jl` for terminfo/color functions
 

@@ -192,3 +192,19 @@ end
     err::Base.Redirectable = Base.stderr,
     extra::Base.Redirectable...,
 ) = Base.Redirectable[in, out, err, extra...]
+
+# Base's `redirect_std*` dups onto fds 0/1/2, which belong to the conductor, so a
+# client redirect must stay within Julia. Every signature Base defines needs an
+# override, or its more specific method wins and reaches the fd.
+@static if VERSION >= v"1.11"
+    for T in (:IO, :(Union{Base.LibuvStream, IOStream}), :(Base.AbstractPipe), :(Base.DevNull))
+        @eval (f::Base.RedirectStdStream)(io::$T) = set_redirect!(f, io)
+    end
+    @eval function (f::Base.RedirectStdStream)(p::Base.Pipe)
+        if p.in.status == Base.StatusInit && p.out.status == Base.StatusInit
+            Base.link_pipe!(p)
+        end
+        set_redirect!(f, getfield(p, f.writable ? :in : :out))
+        p
+    end
+end

@@ -46,9 +46,9 @@ function __init__()
             Base.current_terminfo
         end
         WORKER_TERM.have_color = Base.get_have_color()
-        redirect_stdin(ScopedStdin())
-        redirect_stdout(ScopedStdout())
-        redirect_stderr(ScopedStderr())
+        Base._redirect_io_global(ScopedStdin(), 0)
+        Base._redirect_io_global(ScopedStdout(), 1)
+        Base._redirect_io_global(ScopedStderr(), 2)
     end
 end
 
