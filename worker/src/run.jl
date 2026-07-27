@@ -231,11 +231,16 @@ function teardown_client(client::ClientInfo, client_stdin::IO, client_stdout::IO
     end
     try close(client_stdin) catch end
     isempty(owned_streams) && return
-    if isopen(signals)
-        send_signal(signals, SIGNAL_EXIT, UInt8[exit_code % UInt8])
-        try close(signals) catch end
+    # `isopen` lags a peer close, so signalling a departed client throws; the
+    # unregister must happen regardless or the worker stays at capacity.
+    try
+        if isopen(signals)
+            send_signal(signals, SIGNAL_EXIT, UInt8[exit_code % UInt8])
+            close(signals)
+        end
+    finally
+        unregister_client!(client)
     end
-    unregister_client!(client)
 end
 
 # Basically a bootleg version of `exec_options` from `base/client.jl`. In a sync

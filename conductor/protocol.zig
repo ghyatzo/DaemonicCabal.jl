@@ -215,7 +215,7 @@ pub const PortPool = struct {
     }
 
     pub fn portsForIndex(self: *const PortPool, index: u16) [4]u16 {
-        const start = self.base + index * 4;
+        const start: u16 = @intCast(@as(u32, self.base) + @as(u32, index) * 4);
         return .{ start, start + 1, start + 2, start + 3 };
     }
 };

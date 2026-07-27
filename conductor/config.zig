@@ -193,7 +193,7 @@ fn parsePortRange(s: ?[]const u8) ?Config.PortRange {
     const low = std.fmt.parseInt(u16, str[0..dash], 10) catch return null;
     const high = std.fmt.parseInt(u16, str[dash + 1 ..], 10) catch return null;
     if (high <= low) return null;
-    const count: u16 = (high - low + 1) / 4;
+    const count = @min((high - low + 1) / 4, protocol.PortPool.max_port_sets);
     if (count == 0) return null;
     return .{ .base = low, .count = count };
 }

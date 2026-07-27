@@ -471,7 +471,18 @@ function unregister_client!(client::ClientInfo)
     ensure_standby_module()
 end
 
-function spawn_client!(conn::IO, client::ClientInfo)
+const CLIENT_ACCEPT_TIMEOUT_S = 30.0
+
+# A bare `accept` blocks the message loop indefinitely, so a client that dies
+# after receiving its paths would stall pings and get the whole worker killed.
+function accept_with_timeout(srv)
+    task = @async accept(srv)
+    timedwait(() -> istaskdone(task), CLIENT_ACCEPT_TIMEOUT_S) === :ok ||
+        throw(ErrorException("client did not connect within $(CLIENT_ACCEPT_TIMEOUT_S)s"))
+    fetch(task)
+end
+
+function spawn_client!(conn::IO, client::ClientInfo, replied::Ref{Bool})
     (stdin_srv, stdin_path), (stdout_srv, stdout_path),
         (stderr_srv, stderr_path), (signals_srv, signals_path) = get_client_sockets(client.port_set)
     active_count = @lock STATE.lock begin
@@ -479,10 +490,12 @@ function spawn_client!(conn::IO, client::ClientInfo)
         length(STATE.clients)
     end
     send_sockets(conn, stdin_path, stdout_path, stderr_path, signals_path, active_count)
+    replied[] = true
     is_tcp = stdin_srv isa Sockets.TCPServer
     t0 = time_ns()
     client_stdin, client_stdout, client_stderr, signals = try
-        accept(stdin_srv), accept(stdout_srv), accept(stderr_srv), accept(signals_srv)
+        accept_with_timeout(stdin_srv), accept_with_timeout(stdout_srv),
+        accept_with_timeout(stderr_srv), accept_with_timeout(signals_srv)
     catch
         @lock STATE.lock filter!(e -> last(e) !== client, STATE.clients)
         rethrow()
@@ -537,11 +550,15 @@ function serve_message(conn::IO, header::MessageHeader)
         if draining || (!client.force && MAX_CLIENTS > 0 && active_count >= MAX_CLIENTS)
             send_sockets(conn, "", "", "", "", active_count)  # reject: empty paths + count
         else
+            replied = Ref(false)
             try
-                spawn_client!(conn, client)
+                spawn_client!(conn, client, replied)
             catch err
-                send_error(conn, ERR_CODE.internal_error,
-                           "Failed to start client: $(sprint(showerror, err))")
+                # `sockets` is a complete reply; a trailing `err` would be read as
+                # the next message header and desync the stream for good.
+                replied[] || send_error(conn, ERR_CODE.internal_error,
+                                        "Failed to start client: $(sprint(showerror, err))")
+                @error "Failed to start client" exception=(err, catch_backtrace())
             end
         end
     elseif header.msg_type == MSG_TYPE.query_state

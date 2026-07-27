@@ -26,10 +26,15 @@ const no_value_switches = std.StaticStringMap(void).initComptime(.{
     .{ "--quiet", {} },
 });
 
-// Switches that take an optional value (only via --switch=value syntax)
+// Switches whose value may only be given as --switch=value; a following
+// argument is the program file, as in `julia --project script.jl`.
 const optional_value_switches = std.StaticStringMap(void).initComptime(.{
     .{ "--session", {} },
     .{ "--status", {} },
+    .{ "--project", {} },
+    .{ "--code-coverage", {} },
+    .{ "--track-allocation", {} },
+    .{ "--debug-info", {} },
 });
 
 pub const Switch = struct {

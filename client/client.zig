@@ -106,7 +106,8 @@ const SignalParser = struct {
             const data_len: usize = self.buf[pos + 1];
             const total_len = header_size + data_len;
             if (pos + total_len > self.len) break; // incomplete signal
-            result = self.dispatch(id, self.buf[pos + header_size .. pos + total_len], fd);
+            const signal = self.dispatch(id, self.buf[pos + header_size .. pos + total_len], fd);
+            if (result != .exit) result = signal; // exit is terminal; later signals can't unset it
             pos += total_len;
         }
         // Compact buffer

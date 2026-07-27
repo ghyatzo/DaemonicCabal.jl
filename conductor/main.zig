@@ -129,6 +129,9 @@ const idle_budget_log_span: f64 = @log2((1 + idle_budget_bias) / idle_budget_bia
 /// earns longevity faster. See idleBudget.
 const cadence_mult_divisor: f64 = 2;
 
+/// Per-worker client PIDs a single reconciliation pass can hold.
+const max_tracked_clients = 256;
+
 // --- Global state for cleanup ---
 
 pub var g_socket_path: [:0]const u8 = "";
@@ -530,6 +533,10 @@ pub const Conductor = struct {
         // NOTE: client_args ownership transfers to parsed.
         // The Switch structs in parsed.switches contain slices into these strings,
         // so we must NOT free them here. They are freed via request.deinit().
+        errdefer {
+            for (client_args) |a| self.allocator.free(a);
+            self.allocator.free(client_args);
+        }
         // Remote clients: always request full env (fingerprint cache is per-machine)
         const cached = if (is_remote) blk: {
             platform.write(socket, &[_]u8{protocol.client.env_request});
@@ -1527,12 +1534,12 @@ pub const Conductor = struct {
     // Prune active_clients entries for `w` the worker no longer reports (a lost
     // client_done the count-only sync can't repair).
     fn reconcileClientMap(self: *Conductor, w: *worker.Worker) void {
-        var live_buf: [32]u32 = undefined;
+        var live_buf: [max_tracked_clients]u32 = undefined;
         const live = w.queryClients(&live_buf) catch |err| {
             std.debug.print("Worker {d}: queryClients failed: {}\n", .{ w.id, err });
             return;
         };
-        var stale: [32]u32 = undefined;
+        var stale: [max_tracked_clients]u32 = undefined;
         var n: usize = 0;
         var it = self.active_clients.iterator();
         while (it.next()) |entry| {
@@ -1791,6 +1798,7 @@ pub const Conductor = struct {
     const live_cursor_show = "\x1b[?25h";
     // Live meter half-life: ~1.4s fades prior activity tracking the 1s heartbeat.
     const live_cpu_half_life: f64 = 1.4;
+    const palette_probe_timeout_s = 2;
 
     // First frame was sent by serveStatus; hide the cursor for the live view and
     // start the heartbeat (dirty stays false, so no redundant immediate repaint).
@@ -1923,6 +1931,10 @@ pub const Conductor = struct {
         platform.write(signals, &[_]u8{ protocol.signals.raw_mode, 0x01, 0x01 });
         var qbuf: [pal.query_buf_len]u8 = undefined;
         platform.write(streams.fd(.stdout), pal.writeQueries(&qbuf));
+        // This read blocks the event loop; a client that never replies would
+        // otherwise wedge the conductor.
+        platform.setRecvTimeout(stdin, palette_probe_timeout_s);
+        defer platform.setRecvTimeout(stdin, 0);
         var buf: [4096]u8 = undefined;
         var len: usize = 0;
         while (len < buf.len) {

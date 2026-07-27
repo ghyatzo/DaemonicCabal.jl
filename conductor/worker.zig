@@ -476,7 +476,11 @@ pub const Worker = struct {
         return std.mem.readInt(u16, &count_buf, .little);
     }
 
-    /// Read-only query of the worker's live client PIDs into `buf` (excess dropped).
+    /// Read-only query of the worker's live client PIDs into `buf`.
+    ///
+    /// Returns `error.TooManyClients` if the worker lists more than `buf` can
+    /// hold: a partial list is indistinguishable from clients having exited,
+    /// so callers must not treat it as the live set.
     pub fn queryClients(self: *Worker, buf: []u32) ![]u32 {
         self.writeHeader(.query_clients, 0);
         const header = try self.readHeader();
@@ -489,6 +493,7 @@ pub const Worker = struct {
         var count_buf: [2]u8 = undefined;
         try readExact(self.socket, &count_buf);
         const count = std.mem.readInt(u16, &count_buf, .little);
+        // Drain the full list even when over capacity, or the stream desyncs.
         var n: usize = 0;
         for (0..count) |_| {
             var pid_buf: [4]u8 = undefined;
@@ -498,6 +503,7 @@ pub const Worker = struct {
                 n += 1;
             }
         }
+        if (count > buf.len) return error.TooManyClients;
         return buf[0..n];
     }
 
