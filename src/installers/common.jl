@@ -25,14 +25,15 @@ function daemon_env(; worker_maxclients::Integer, worker_ttl::Integer,
                     ports::UnitRange{Int}, env)
     mode in (:sockets, :tcp) || throw(ArgumentError("mode must be :sockets or :tcp, got :$mode"))
     d = Dict{String,String}(
-        "JULIA_DAEMON_SERVER" => mainsocket(),
         "JULIA_DAEMON_WORKER_EXECUTABLE" => worker_executable(),
         "JULIA_DAEMON_WORKER_PROJECT" => installed_worker_project(),
         "JULIA_DAEMON_WORKER_MAXCLIENTS" => string(worker_maxclients),
         "JULIA_DAEMON_WORKER_ARGS" => worker_args,
         "JULIA_DAEMON_WORKER_TTL" => string(worker_ttl))
-    if haskey(ENV, "JULIA_NUM_THREADS")
-        d["JULIA_NUM_THREADS"] = ENV["JULIA_NUM_THREADS"]
+    for optkey in ("JULIA_DAEMON_SERVER", "JULIA_NUM_THREADS")
+        if haskey(ENV, optkey)
+            d[optkey] = ENV[optkey]
+        end
     end
     if mode === :tcp
         d["JULIA_DAEMON_SERVER"] = "$conductor_host:$conductor_port"
