@@ -61,7 +61,7 @@ const DAEMON_MANAGEMENT_HELP = switch (builtin.os.tag) {
     .macos =>
         \\Daemon management (launchd):
         \\
-        \\ launchctl {start | stop} net.julialang.julia-daemon
+        \\ launchctl {start | stop} org.julialang.julia-daemon
         \\ tail -f ~/Library/Logs/julia-daemon.log
         \\
     ,

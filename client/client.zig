@@ -303,7 +303,7 @@ fn connectToConductor(env: EnvInfo) !Io.net.Stream {
         \\
     , .{ addr, switch (builtin.os.tag) {
         .linux => "systemctl --user restart julia-daemon",
-        .macos => "launchctl kickstart -k gui/$(id -u)/net.julialang.julia-daemon",
+        .macos => "launchctl kickstart -k gui/$(id -u)/org.julialang.julia-daemon",
         else => "pkill -f julia-conductor && julia-conductor &",
     } });
     exitClient(127);
