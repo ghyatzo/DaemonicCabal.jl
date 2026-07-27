@@ -52,12 +52,154 @@ pub const SandboxConfig = struct {
     worker_id: u32, // conductor-assigned worker ID (unique, used for cgroup naming)
     // Isolation
     host_home: []const u8,
+    depot_env: ?[]const u8 = null, // host JULIA_DEPOT_PATH, verbatim (null = unset)
     extra_ro_binds: []const []const u8 = &.{},
     extra_rw_binds: []const []const u8 = &.{},
     empty_environment: bool = true,
     max_memory: ?[]const u8,
     max_cpu: ?u32,
 };
+
+/// Maximum depot entries mounted; further entries are ignored with a warning.
+pub const max_depots: usize = 8;
+
+pub const DepotMount = struct {
+    path: []const u8,
+    /// Overlaid rather than bound read-only. Set for the depot Julia writes to
+    /// and for any depot containing it, since a read-only ancestor would place
+    /// that overlay beneath a read-only mount.
+    writable: bool,
+};
+
+/// Depot directories to mount, deduplicated and ordered shallowest-first so a
+/// nested depot lands on top of its ancestors rather than under them.
+pub const DepotTargets = struct {
+    entries: [max_depots]DepotMount = undefined,
+    len: usize = 0,
+    writable_at: usize = 0,
+
+    pub fn slice(self: *const DepotTargets) []const DepotMount {
+        return self.entries[0..self.len];
+    }
+
+    pub fn writablePath(self: *const DepotTargets) []const u8 {
+        return if (self.len == 0) "" else self.entries[self.writable_at].path;
+    }
+
+    /// The first occurrence wins, so a later duplicate cannot displace the
+    /// writable depot.
+    fn push(self: *DepotTargets, path: []const u8) void {
+        if (path.len == 0) return;
+        for (self.entries[0..self.len]) |e|
+            if (std.mem.eql(u8, e.path, path)) return;
+        if (self.len >= max_depots) {
+            std.debug.print("Sandbox: >{d} depot entries, ignoring {s}\n", .{ max_depots, path });
+            return;
+        }
+        self.entries[self.len] = .{ .path = path, .writable = self.len == 0 };
+        self.len += 1;
+    }
+
+    /// Apply the ancestor rule and mount ordering. Required before mounting: a
+    /// mount over an ancestor shadows everything already mounted beneath it.
+    fn arrange(self: *DepotTargets) void {
+        if (self.len == 0) return;
+        const writable = self.entries[0].path;
+        for (self.entries[1..self.len]) |*e|
+            e.writable = isStrictAncestor(e.path, writable);
+        // Stable, so unrelated depots at equal depth keep their written order.
+        std.mem.sort(DepotMount, self.entries[0..self.len], {}, struct {
+            fn lessThan(_: void, a: DepotMount, b: DepotMount) bool {
+                return pathDepth(a.path) < pathDepth(b.path);
+            }
+        }.lessThan);
+        // Ancestors sort before the depot they contain, so the last wins.
+        for (self.slice(), 0..) |e, i|
+            if (e.writable) { self.writable_at = i; };
+    }
+};
+
+/// Resolve `JULIA_DEPOT_PATH` to the directories the sandbox must mount, in
+/// mount order and tagged with their access mode.
+///
+/// Follows the Julia manual's empty-entry rules: an empty entry expands to the
+/// defaults, *including* the user depot unless an explicit entry already
+/// supplies one; an entirely empty variable yields no depots. Bundled system
+/// depots are not returned — they live under the Julia install root, which is
+/// mounted separately.
+pub fn resolveDepots(depot_env: ?[]const u8, host_home: []const u8) DepotTargets {
+    var out: DepotTargets = .{};
+    // An empty string is a zero-element list, not a one-element empty list.
+    const env = depot_env orelse "";
+    if (depot_env != null and env.len == 0) return out;
+    // A leading empty entry puts the user depot first; so does the absence of
+    // any explicit entry, which is why ":" is equivalent to leaving env unset.
+    const explicit = std.mem.indexOfNone(u8, env, ":") != null;
+    if (!explicit or env[0] == ':') out.push(homeDepotPath(host_home));
+    var it = std.mem.splitScalar(u8, env, ':');
+    while (it.next()) |entry| {
+        if (entry.len > 0) out.push(entry); // empties add bundled paths, not mounts
+    }
+    out.arrange();
+    return out;
+}
+
+/// Where the Julia executable's supporting files live.
+pub const InstallRoot = union(enum) {
+    /// Directory containing `share/julia/base` — a complete Julia install.
+    install_root: []const u8,
+    /// Directory containing `juliaup.json` — a juliaup home holding every channel.
+    launcher_home: []const u8,
+    /// No marker found; nothing safe to bind.
+    unrecognised,
+};
+
+/// Directories never bound as an install root, whatever markers they contain.
+fn isDangerousRoot(path: []const u8, host_home: []const u8) bool {
+    if (path.len == 0) return true;
+    if (std.mem.eql(u8, path, "/")) return true;
+    if (std.mem.eql(u8, path, "/home")) return true;
+    if (std.mem.eql(u8, path, "/root")) return true;
+    return host_home.len > 0 and std.mem.eql(u8, path, host_home);
+}
+
+/// True if `path` exists, via a raw syscall (no allocator, no `Io` — this runs
+/// in the post-fork sandbox child as well as from the parent).
+fn pathExists(path: [*:0]const u8) bool {
+    return errnoFromRc(linux.access(path, 0)) == null;
+}
+
+/// Classify the Julia executable's install directory, walking up at most two
+/// levels and recognising the root by content: a Julia install always carries
+/// `share/julia/base`, a juliaup home `juliaup.json`. Recognition by shape is
+/// unsafe — `dirname(dirname("/home/user/julia"))` is `/home`.
+///
+/// `exe_path` must NOT be canonicalised: juliaup's per-channel symlinks resolve
+/// to one versioned install, but the launcher may exec any channel, so only the
+/// unresolved path describes the mount actually needed.
+///
+/// `prefix` is prepended when probing, but not to the result — the sandbox
+/// child runs after `pivot_root`, where the host is under `/oldroot`.
+pub fn classifyInstallPrefixed(exe_path: []const u8, host_home: []const u8, prefix: []const u8) InstallRoot {
+    if (exe_path.len == 0 or exe_path[0] != '/') return .unrecognised;
+    var dir = std.fs.path.dirname(exe_path) orelse return .unrecognised;
+    var level: usize = 0;
+    while (level < 2) : (level += 1) {
+        if (isDangerousRoot(dir, host_home)) return .unrecognised;
+        var buf: [512]u8 = undefined;
+        if (fmtPath(&buf, "{s}{s}/share/julia/base", .{ prefix, dir })) |marker|
+            if (pathExists(marker)) return .{ .install_root = dir };
+        if (fmtPath(&buf, "{s}{s}/juliaup.json", .{ prefix, dir })) |marker|
+            if (pathExists(marker)) return .{ .launcher_home = dir };
+        dir = std.fs.path.dirname(dir) orelse return .unrecognised;
+    }
+    return .unrecognised;
+}
+
+/// Classify against the live filesystem, for callers outside the sandbox child.
+pub fn classifyInstall(exe_path: []const u8, host_home: []const u8) InstallRoot {
+    return classifyInstallPrefixed(exe_path, host_home, "");
+}
 
 pub const SandboxError = error{
     ForkFailed,
@@ -171,6 +313,7 @@ fn setupFilesystem(config: *const SandboxConfig) SandboxError!void {
     try mountStaging();
     try mountSystemDirs();
     try mountHome(config, home);
+    try mountJuliaInstall(config.julia_executable, home);
     // Extra read-only bind mounts
     for (config.extra_ro_binds) |path| {
         if (path.len == 0) continue;
@@ -291,49 +434,128 @@ fn mountSystemDirs() SandboxError!void {
     robindOptional("/oldroot/opt", "/newroot/opt");
 }
 
-/// Mount /home tmpfs, juliaup config bind, depot overlay, and sandbox symlink.
+/// Bind the Julia install root, so the binary can reach its sibling
+/// `share/julia` and `lib/julia`. Roots under `/usr` or `/opt` are skipped —
+/// `mountSystemDirs` has bound those already.
+///
+/// A juliaup launcher additionally needs its home at `$HOME/.julia/juliaup`:
+/// that is where it looks, and `HOME` is `/home/sandbox` here, so the host-path
+/// bind alone is never consulted. `juliaup.json`'s relative `Path` entries
+/// bring the versioned installs along with it.
+fn mountJuliaInstall(exe_path: []const u8, home: []const u8) SandboxError!void {
+    const install = classifyInstallPrefixed(exe_path, home, "/oldroot");
+    const root = switch (install) {
+        .install_root, .launcher_home => |r| r,
+        .unrecognised => {
+            std.debug.print("Sandbox: cannot place Julia install for {s} — no share/julia or juliaup.json within two levels; the worker will likely fail to load Base\n", .{exe_path});
+            return;
+        },
+    };
+    var src_buf: [512]u8 = undefined;
+    const src = fmtPath(&src_buf, "/oldroot{s}", .{root}) orelse return SandboxError.PathTooLong;
+    if (!isWithin(root, "/usr") and !isWithin(root, "/opt")) {
+        var dst_buf: [512]u8 = undefined;
+        if (fmtPath(&dst_buf, "/newroot{s}", .{root})) |dst| {
+            mkdirp(dst);
+            robindOptional(src, dst);
+        }
+    }
+    if (install == .launcher_home) {
+        mkdirp("/newroot/home/sandbox/.julia/juliaup");
+        robindOptional(src, "/newroot/home/sandbox/.julia/juliaup");
+    }
+}
+
+/// `$HOME/.julia` — the default depot location — or empty if there is no home.
+/// Returned in a static buffer: the sandbox child is single-threaded, and
+/// callers consume the slice before resolving again.
+var home_depot_buf: [384]u8 = undefined;
+fn homeDepotPath(home: []const u8) []const u8 {
+    if (home.len == 0) return "";
+    return std.fmt.bufPrint(&home_depot_buf, "{s}/.julia", .{home}) catch "";
+}
+
+/// Mount /home tmpfs, the resolved depots, and the sandbox home symlink.
 fn mountHome(config: *const SandboxConfig, home: []const u8) SandboxError!void {
     try mkdirE("/newroot/home");
     mountTmpfs("/newroot/home", MS_NOSUID | MS_NODEV, "mode=0755") catch
         return SandboxError.MountFailed;
     if (home.len == 0) return;
-    // Juliaup config: sandbox runs as uid 0, so juliaup looks at
-    // /root/.julia/juliaup/. Bind the real user's dir there (rw for lockfile).
-    var juliaup_buf: [384]u8 = undefined;
-    if (fmtPath(&juliaup_buf, "/oldroot{s}/.julia/juliaup", .{home})) |src| {
-        mkdirp("/newroot/root/.julia/juliaup");
-        mountBind(src, "/newroot/root/.julia/juliaup") catch {};
+    const depots = resolveDepots(config.depot_env, home);
+    if (depots.len == 0) return;
+    // Mounted at their host paths, since precompile caches embed absolute paths.
+    for (depots.slice()) |depot| {
+        var dst_buf: [384]u8 = undefined;
+        const dst = fmtPath(&dst_buf, "/newroot{s}", .{depot.path}) orelse continue;
+        mkdirp(dst);
+        if (depot.writable) {
+            mountDepotOverlay(config, depot.path, dst);
+        } else {
+            var src_buf: [384]u8 = undefined;
+            const src = fmtPath(&src_buf, "/oldroot{s}", .{depot.path}) orelse continue;
+            robindOptional(src, dst);
+        }
     }
-    // Depot overlay at the host path (precompile caches embed absolute paths)
-    var depot_buf: [384]u8 = undefined;
-    const depot = fmtPath(&depot_buf, "/newroot{s}/.julia", .{home}) orelse
-        return SandboxError.PathTooLong;
-    mkdirp(depot);
-    mountDepotOverlay(config, home, depot);
-    // /home/sandbox with symlink to depot
-    mkdirE("/newroot/home/sandbox") catch {};
-    var link_buf: [384]u8 = undefined;
-    if (fmtPath(&link_buf, "{s}/.julia", .{home})) |target|
-        _ = linux.symlink(target, "/newroot/home/sandbox/.julia");
+    try linkSandboxDepot(depots.writablePath(), home);
 }
 
-/// Mount overlayfs on the depot directory, with fallback to read-only bind.
-fn mountDepotOverlay(config: *const SandboxConfig, home: []const u8, depot: [*:0]const u8) void {
+/// Point `/home/sandbox/.julia` at the writable depot, for tools that resolve
+/// the depot relative to `HOME`.
+///
+/// A symlink suffices only when nothing else need live under it; the juliaup
+/// bind does, so a relocated depot gets a real directory with the depot bound
+/// inside. That bind sources from `/newroot` to keep writes on the overlay, so
+/// it must run after every depot mount.
+fn linkSandboxDepot(depot: []const u8, home: []const u8) SandboxError!void {
+    mkdirE("/newroot/home/sandbox") catch {};
+    var buf: [384]u8 = undefined;
+    if (std.mem.eql(u8, depot, homeDepotPath(home))) {
+        if (fmtPath(&buf, "{s}", .{depot})) |target|
+            _ = linux.symlink(target, "/newroot/home/sandbox/.julia");
+    } else {
+        mkdirp("/newroot/home/sandbox/.julia");
+        if (fmtPath(&buf, "/newroot{s}", .{depot})) |src|
+            mountBind(src, "/newroot/home/sandbox/.julia") catch {};
+    }
+}
+
+/// Number of path components, for ordering nested mounts ancestor-first.
+fn pathDepth(path: []const u8) usize {
+    return std.mem.count(u8, path, "/");
+}
+
+/// True if `path` is `dir` or lies within it (component-wise, so `/usrlocal`
+/// is not within `/usr`).
+pub fn isWithin(path: []const u8, dir: []const u8) bool {
+    return std.mem.eql(u8, path, dir) or isStrictAncestor(dir, path);
+}
+
+/// True if `ancestor` strictly contains `descendant` (component-wise, so
+/// `/foo` does not contain `/foobar`).
+pub fn isStrictAncestor(ancestor: []const u8, descendant: []const u8) bool {
+    if (ancestor.len >= descendant.len) return false;
+    if (!std.mem.startsWith(u8, descendant, ancestor)) return false;
+    return descendant[ancestor.len] == '/';
+}
+
+/// Mount overlayfs on `depot_dst`, with the host path `depot_src` as the
+/// read-only lower layer. Falls back to a read-only bind if overlay fails.
+fn mountDepotOverlay(config: *const SandboxConfig, depot_src: []const u8, depot_dst: [*:0]const u8) void {
     var opts_buf: [512]u8 = undefined;
     const opts = fmtPath(&opts_buf,
-        "upperdir=/ovl-upper,workdir=/ovl-work,lowerdir=/oldroot{s}/.julia,userxattr",
-        .{home}) orelse return;
-    mountOrFail("overlay", depot, "overlay", 0, opts) catch {
-        std.debug.print("Sandbox: overlay on ~/.julia failed, falling back to bind mount\n", .{});
+        "upperdir=/ovl-upper,workdir=/ovl-work,lowerdir=/oldroot{s},userxattr",
+        .{depot_src}) orelse return;
+    mountOrFail("overlay", depot_dst, "overlay", 0, opts) catch {
+        std.debug.print("Sandbox: overlay on {s} failed, falling back to bind mount\n", .{depot_src});
         var src_buf: [384]u8 = undefined;
-        if (fmtPath(&src_buf, "/oldroot{s}/.julia", .{home})) |src|
-            robindOptional(src, depot);
+        if (fmtPath(&src_buf, "/oldroot{s}", .{depot_src})) |src|
+            robindOptional(src, depot_dst);
         return;
     };
-    // Mask ~/.julia/environments so the sandbox can't see or modify host environments
+    // Mask <depot>/environments so the sandbox can't see or modify host environments
     if (config.empty_environment) {
         var env_buf: [384]u8 = undefined;
-        if (fmtPath(&env_buf, "/newroot{s}/.julia/environments", .{home})) |env_path| {
+        if (fmtPath(&env_buf, "/newroot{s}/environments", .{depot_src})) |env_path| {
             mkdirE(env_path) catch {};
             mountTmpfs(env_path, MS_NOSUID | MS_NODEV, "mode=0755") catch {};
         }
@@ -403,9 +625,10 @@ const env_allowlist = [_][]const u8{
 };
 
 /// Keys always overridden rather than passed through from the host.
+/// `JULIA_DEPOT_PATH` is deliberately absent: it passes through verbatim so
+/// Julia's own expansion resolves to the paths the sandbox mounted.
 const env_managed = [_][]const u8{
     "HOME", "USER", "LOGNAME", "PATH",
-    "JULIA_DEPOT_PATH",
 };
 
 fn buildEnvp(allocator: Allocator, config: *const SandboxConfig) ![:null]?[*:0]const u8 {
@@ -424,11 +647,10 @@ fn buildEnvp(allocator: Allocator, config: *const SandboxConfig) ![:null]?[*:0]c
     try list.append(try allocator.dupeZ(u8, "HOME=/home/sandbox"));
     try list.append(try allocator.dupeZ(u8, "USER=sandbox"));
     try list.append(try allocator.dupeZ(u8, "LOGNAME=sandbox"));
-    if (config.host_home.len > 0) {
+    // PATH leads with the directory holding the Julia binary actually invoked.
+    if (std.fs.path.dirname(config.julia_executable)) |bindir| {
         try list.append(try std.fmt.allocPrintSentinel(allocator,
-            "PATH={s}/.julia/juliaup/bin:/usr/local/bin:/usr/bin:/bin", .{config.host_home}, 0));
-        try list.append(try std.fmt.allocPrintSentinel(allocator,
-            "JULIA_DEPOT_PATH={s}/.julia:", .{config.host_home}, 0));
+            "PATH={s}:/usr/local/bin:/usr/bin:/bin", .{bindir}, 0));
     } else {
         try list.append(try allocator.dupeZ(u8, "PATH=/usr/local/bin:/usr/bin:/bin"));
     }

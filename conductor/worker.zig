@@ -284,6 +284,7 @@ pub const Worker = struct {
                 .setup_socket_path = setup.addr,
                 .worker_id = id,
                 .host_home = cfg.host_home,
+                .depot_env = environ_map.?.get("JULIA_DEPOT_PATH"),
                 .extra_ro_binds = ro_binds[0..n_ro],
                 .extra_rw_binds = extra_rw_binds,
                 .empty_environment = cfg.sandbox_empty_environment,
