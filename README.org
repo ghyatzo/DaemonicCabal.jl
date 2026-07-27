@@ -2,6 +2,12 @@
 
 /Run a script many times, compile it once./
 
+*Quickstart*
+
+#+begin_src shell
+julia --project=temp -e 'using Pkg; Pkg.add(url="https://github.com/tecosaur/DaemonicCabal.jl.git"); using DaemonicCabal; DaemonicCabal.install()'
+#+end_src
+
 Once installed, =DaemonicCabal.jl= provides =juliaclient=, which serves as a
 drop-in replacement for a subset of =julia=, with a few extra tricks.
 
@@ -42,12 +48,6 @@ Daemon management (systemd):
 #+end_example
 
 Supported platforms: Linux, macOS, FreeBSD, and OpenBSD.
-
-* Usage
-
-+ Install somewhere (potentially in a separate package environment)
-+ Run =using DaemonicCabal; DaemonicCabal.install()=
-+ Use =juliaclient= as a (mostly) drop-in replacement for =julia=
 
 * Sessions
 
