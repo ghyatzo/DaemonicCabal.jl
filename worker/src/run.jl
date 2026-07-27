@@ -148,7 +148,8 @@ function runclient(client::ClientInfo, client_stdin::StreamIO,
     # written just before the frontend blocks on stdin, so buffering would strand it
     # (the prompt never reaches the client). Bulk `print` throughput — the reason to
     # buffer — is a non-interactive concern. teardown owns the buffer via owned_streams.
-    client_stdout_b, owned_streams = if !is_repl_client(client) && client_stdout isa Union{Base.PipeEndpoint, Sockets.TCPSocket}
+    # The <1.11 `redirect_stdio` path needs a stream owning an fd, which this lacks.
+    client_stdout_b, owned_streams = if VERSION >= v"1.11" && !is_repl_client(client) && client_stdout isa StreamIO
         buffered = BufferedOutput(client_stdout)
         buffered, map(s -> if s === client_stdout; buffered else s end, owned_streams)
     else
