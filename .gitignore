@@ -3,3 +3,5 @@ builds/
 client/client
 client/client.o
 client/client.tar.gz
+
+.sublime/
