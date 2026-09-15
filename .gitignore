@@ -3,3 +3,7 @@ builds/
 client/client
 client/client.o
 client/client.tar.gz
+
+*.exe
+*.pdb
+.sublime/
